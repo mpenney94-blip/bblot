@@ -14,7 +14,7 @@ import random
 import shutil
 
 import winprob
-from dashboard import commentary, config, render, stats, weekly
+from dashboard import commentary, config, dynasty, render, stats, weekly
 from dashboard.render import esc
 
 
@@ -22,9 +22,6 @@ from dashboard.render import esc
 # page tags them "new" for NEW_DAYS after (finished seasons are cached, so a tag there could outstay its two weeks).
 # Add an entry whenever a table is added or meaningfully changed; old entries can stay (they simply stop showing).
 SECTION_NEW = {
-    "perfect-bids": "2026-11-11", "alltime-perfect-bids": "2026-11-11",
-    "sub100": "2026-11-23", "highloss": "2026-11-23",
-
 }
 NEW_DAYS = 14
 
@@ -350,6 +347,8 @@ def build(league_id, out, with_winprob=True, tabs="", past_sums=None):
         "draft": (f"{kind} report card", draft_chart(lg)),
         "rounds": (f"Points by {kind.lower()} round", render.round_table(src, max((p["round"] for p in lg.picks), default=0))),
     })
+    dyn = dynasty.sections(lg) if not lg.complete else []
+    S.update({k: (t, h) for k, t, h in dyn})
     groups = [
         ("this-week", "This week", f"What happened in week {last} and what’s coming next. These change every week.",
          [k for k, _, _ in hub] + ["history"]),
@@ -361,6 +360,9 @@ def build(league_id, out, with_winprob=True, tabs="", past_sums=None):
                                 "How this year’s rookie draft played out so far, and how much each team leans on what it drafted."),
          ["draft-grades", "draft", "draft-board", "redraft", "rounds", "payoff", "sources", "first-round"]),
     ]
+    if dyn:  # dynasty views describe rosters as they stand today, so only the current season has them
+        groups.insert(1, ("dynasty", "Dynasty", "Built for now or for later: roster value with age, the contention window, draft "
+                                                "picks and taxi squads.", [k for k, _, _ in dyn]))
     groups = [(gid, name, blurb, [k for k in keys if S.get(k)]) for gid, name, blurb, keys in groups]
     toc = ('<nav class="toc" aria-label="Sections">'
            + "".join(f'<div class="grp"><span><a href="#{gid}" style="all:unset;cursor:pointer">{name}</a></span>'
@@ -410,6 +412,11 @@ def seasons(league_id):
 
 def alltime_page(name, tabs, sums):
     secs = render.alltime_sections(sums)
+    for k, t, f in (("rookie-hits", "Draft hit rates", dynasty.hit_rates_html), ("startup-redraft", "Startup redraft to date", dynasty.startup_redraft_html),
+                    ("pick-ledger", "Pick trade ledger", dynasty.pick_ledger_html)):
+        h = f(sums)
+        if h:
+            secs.append((k, t, h))
     talk = ("rivalries", "Rivalry trash talk", render.column(*commentary.write("rivalry", render.rivalry_facts(sums)), "the league’s head-to-head history"))
     secs.insert(2, talk)  # right after head to head
     S = {k: (t, h) for k, t, h in secs}
@@ -419,7 +426,7 @@ def alltime_page(name, tabs, sums):
         ("at-rivalries", "Rivalries", "Every manager against every other manager.", ["head-to-head", "rivalries", "streaks"]),
         ("at-records", "Records", "The best and worst single games and seasons, and who the schedule has favored.", ["record-book", "big-games", "bench-disasters", "alltime-carry", "by-week", "sub100", "highloss", "luck", "injury-luck"]),
         ("at-moves", "Roster moves", "Drafts, trades and the waiver wire across every season.",
-         ["draft-history", "alltime-trades", "tendencies", "alltime-flex", "alltime-sources", "alltime-overbids", "alltime-perfect-bids", "loyalty", "moves", "alltime-churn"]),
+         ["draft-history", "rookie-hits", "startup-redraft", "pick-ledger", "alltime-trades", "tendencies", "alltime-flex", "alltime-sources", "alltime-overbids", "alltime-perfect-bids", "loyalty", "moves", "alltime-churn"]),
     ]
     groups = [(gid, g, blurb, [k for k in keys if k in S]) for gid, g, blurb, keys in groups]
     placed = {k for *_, keys in groups for k in keys}
@@ -434,7 +441,7 @@ def alltime_page(name, tabs, sums):
             + "".join(f'<div class="group-head" id="{gid}"><h2>{g}</h2><p>{blurb}</p></div>'
                       + "".join(f'<section id="{k}"><h2>{esc(S[k][0])}</h2>{S[k][1]}</section>' for k in keys) for gid, g, blurb, keys in groups)
             + render.footer(dt.datetime.now(dt.timezone.utc)) + render.HIGHLIGHT_JS)
-    return render.page(f"{name} all-time", body, f"{name}: all-time standings, finishes, champions, keepers, trades, pickups and drops.")
+    return render.page(f"{name} all-time", body, f"{name}: all-time standings, finishes, champions, drafts, trades, pickups and drops.")
 
 
 def build_all(league_id, out, with_winprob=True, past_cache=None, only=None):

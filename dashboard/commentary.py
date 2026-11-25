@@ -47,6 +47,22 @@ def _p(x):
     return round(x * 100)
 
 
+def dynasty_facts(lg, w, kind):
+    """Each team's dynasty situation (contender, rebuilding, failed tank, failed push...), for the latest recap and the
+    coming week's preview only: it describes rosters and trades as they stand today, so older weeks' columns skip it."""
+    latest = (w == lg.weeks[-1]) if kind == "recap" else (w == lg.next_week)
+    if lg.complete or not latest:
+        return {}
+    if "_dyn_tags" not in lg.__dict__:
+        from dashboard import dynasty  # late import: dynasty imports render, which the columns don't otherwise need
+        try:
+            lg._dyn_tags = dynasty.tags_for_columns(lg)
+        except Exception as e:  # the columns can do without it
+            print(f"dynasty tags skipped: {e!r}")
+            lg._dyn_tags = {}
+    return {"dynasty_situation": lg._dyn_tags} if lg._dyn_tags else {}
+
+
 def week_facts(lg, w, wp=None, odds_now=None, odds_prev=None):
     proj, _ = lg.proj(w)
     sc = lg.scores(w)
@@ -98,6 +114,7 @@ def week_facts(lg, w, wp=None, odds_now=None, odds_prev=None):
         "awards": {k: [v[0], round(v[1], 2) if isinstance(v[1], float) else v[1], v[2]] for k, v in aw.items()},
         "records_broken": records_broken(lg, w),
         **trade_facts(lg, w, "recap"),
+        **dynasty_facts(lg, w, "recap"),
         **({"team_renames_this_week": rename_facts(lg, w)} if rename_facts(lg, w) else {}),
     }
     if odds_now and odds_prev:
@@ -600,6 +617,7 @@ def preview_facts(lg, w, odds=None, min_ppg=8.0):
     left = [x for x in lg.reg_weeks if x >= w]
     return {"week": w, "league": lg.name, "regular_season_weeks_left_including_this_one": len(left),
             "playoff_teams": lg.playoff_teams, "games_closest_first": out, **trade_facts(lg, w, "preview"),
+            **dynasty_facts(lg, w, "preview"),
             **({"team_renames_this_week": rename_facts(lg, w)} if rename_facts(lg, w) else {})}
 
 
@@ -610,6 +628,13 @@ savage and specific: mock bad lineup decisions, players who flopped, teams that 
 blown leads, and whoever is circling the drain. Give credit where it's due too, but backhanded compliments are encouraged.
 Don't hold back. Profanity is fine in moderation. Keep it about fantasy football and the decisions people made - no jokes about
 real players' personal lives, health or off-field legal troubles, and nothing hateful.
+
+This is a dynasty league: managers keep their players year to year, draft rookies each summer and trade future draft picks,
+so not every team is trying to win this season. Some are contending and some are rebuilding (tanking for better picks and
+building around young players). Judge each team by what it is trying to do, and call out the ones failing at it: a contender
+that keeps losing or a team that traded for veterans and is still sinking (a failed push), and a rebuilder that sold off
+its vets and keeps winning anyway, which only costs it draft position (a failed tank). When dynasty_situation is in the
+facts, it tags each team and lists this season's trades; a contender facing a rebuilder is a fine angle for a preview.
 
 Use only the facts and league notes you're given; never invent stats, scores, players or events. Team names are the managers' identities - roast the
 team/manager by team name. Write 5 to 7 short paragraphs, each 1-3 sentences, punchy, with no headings, no bullet points, no emoji,
