@@ -24,7 +24,7 @@ from dashboard.render import esc
 SECTION_NEW = {
     "perfect-bids": "2026-11-11", "alltime-perfect-bids": "2026-11-11",
     "sub100": "2026-11-23", "highloss": "2026-11-23",
-    "fruit-ninja": "2026-11-23",
+
 }
 NEW_DAYS = 14
 
@@ -289,6 +289,8 @@ def build(league_id, out, with_winprob=True, tabs="", past_sums=None):
     hub = week_hub(lg, last, with_winprob, wp_cache, odds, div_names)
     season_games = [(lg.season, *g) for g in stats.game_list(lg) if not g[5]]
     team_html = lambda o, _s: f'<span class="team">{esc(next((n for r, n in lg.team.items() if lg.owner[r] == o), "?"))}</span>'
+    startup = int(lg.season) == config.FIRST_SEASON  # the 2025 draft was the dynasty startup; every one after is a rookie draft
+    kind = "Startup draft" if startup else "Rookie draft"
     inj_rows = weekly.injuries(lg)
     proj_rows, proj_over, proj_under = weekly.vs_projection(lg)
     tr_rows, tr_league = weekly.trends(lg)
@@ -338,16 +340,15 @@ def build(league_id, out, with_winprob=True, tabs="", past_sums=None):
         "drops": ("Drops that came back to bite", '<p class="lede">The worst cuts of the season: players who went on to produce after their team let them go.</p>'
                   + render.drop_table(stats.drop_regrets(lg))),
         "position": ("Position strength", render.position_table(*weekly.position_strength(lg))),
-        "draft-grades": ("Draft grades", render.draft_grades(dx)) if dx else None,
-        "draft-board": ("Draft board", render.draft_board(dx, lg.team)) if dx else None,
-        "redraft": ("Redraft", render.redraft_table(dx)) if dx else None,
+        "draft-grades": (f"{kind} grades", render.draft_grades(dx)) if dx else None,
+        "draft-board": (f"{kind} board", render.draft_board(dx, lg.team)) if dx else None,
+        "redraft": (f"{kind.split()[0]} redraft", render.redraft_table(dx)) if dx else None,
         "payoff": ("Which positions paid off", render.payoff_table(dx)) if dx else None,
         "sources": ("Drafted vs. picked up", render.source_bars(src)),
-        "fruit-ninja": ("Fruit Ninja Fractalverse", '<p class="lede">What if your first-round pick had been someone else’s? Pick a '
-                        'team and another first-rounder to replay the season.</p>' + render.fractal_html(stats.fractalverse(lg)))
-                       if int(lg.season) >= 2026 else None,
-        "draft": ("Draft report card", draft_chart(lg)),
-        "rounds": ("Points by draft round", render.round_table(src, max((p["round"] for p in lg.picks), default=0))),
+        "first-round": ("First round what ifs", f'<p class="lede">What if your first-round {kind.lower()} pick had been someone '
+                        'else’s? Pick a team and another first-rounder to replay the season.</p>' + render.fractal_html(stats.fractalverse(lg))),
+        "draft": (f"{kind} report card", draft_chart(lg)),
+        "rounds": (f"Points by {kind.lower()} round", render.round_table(src, max((p["round"] for p in lg.picks), default=0))),
     })
     groups = [
         ("this-week", "This week", f"What happened in week {last} and what’s coming next. These change every week.",
@@ -356,8 +357,9 @@ def build(league_id, out, with_winprob=True, tabs="", past_sums=None):
          ["standings", "trends", "projections", "close", "sub100", "highloss", "peaks", "flags", "kickers", "coaches", "schedule", "carry", "boom-bust", "team-grid"]),
         ("roster", "Roster", "Trades, byes, injuries, lineup calls and the waiver wire.",
          ["trades", "byes", "injuries", "ages", "bench", "flex", "waivers", "churn", "waiver-wars", "perfect-bids", "overbids", "drops", "position"]),
-        ("draft-group", "Draft", "How the draft played out, and how much each team still leans on it.",
-         ["draft-grades", "draft", "draft-board", "redraft", "rounds", "payoff", "sources", "fruit-ninja"]),
+        ("draft-group", kind, ("How the startup draft played out, and how much each team still leans on it." if startup else
+                                "How this year’s rookie draft played out so far, and how much each team leans on what it drafted."),
+         ["draft-grades", "draft", "draft-board", "redraft", "rounds", "payoff", "sources", "first-round"]),
     ]
     groups = [(gid, name, blurb, [k for k in keys if S.get(k)]) for gid, name, blurb, keys in groups]
     toc = ('<nav class="toc" aria-label="Sections">'
@@ -416,8 +418,8 @@ def alltime_page(name, tabs, sums):
          ["alltime-standings", "finishes", "champions", "playoff-records"]),
         ("at-rivalries", "Rivalries", "Every manager against every other manager.", ["head-to-head", "rivalries", "streaks"]),
         ("at-records", "Records", "The best and worst single games and seasons, and who the schedule has favored.", ["record-book", "big-games", "bench-disasters", "alltime-carry", "by-week", "sub100", "highloss", "luck", "injury-luck"]),
-        ("at-moves", "Roster moves", "Keepers, drafts, trades and the waiver wire across every season.",
-         ["keepers", "draft-history", "alltime-trades", "tendencies", "alltime-flex", "alltime-sources", "alltime-overbids", "alltime-perfect-bids", "loyalty", "moves", "alltime-churn"]),
+        ("at-moves", "Roster moves", "Drafts, trades and the waiver wire across every season.",
+         ["draft-history", "alltime-trades", "tendencies", "alltime-flex", "alltime-sources", "alltime-overbids", "alltime-perfect-bids", "loyalty", "moves", "alltime-churn"]),
     ]
     groups = [(gid, g, blurb, [k for k in keys if k in S]) for gid, g, blurb, keys in groups]
     placed = {k for *_, keys in groups for k in keys}

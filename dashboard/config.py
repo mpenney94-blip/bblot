@@ -36,3 +36,8 @@ def pct_text(v, budget):
 def money_text(v, budget):
     """A single bid: share of the budget, then the dollars: '13% ($130)'."""
     return f"{pct_text(v, budget)} (${v:,})"
+
+
+# Threshold menus for Low-scoring wins / High-scoring losses (BBLOT scores about 124 a game: full PPR, two flex spots).
+WIN_CUTS = [120, 115, 110, 105, 100]
+LOSS_CUTS = [130, 135, 140, 145, 150]

@@ -566,7 +566,7 @@ def drop_regrets(lg, top=10, skip=("K", "DEF"), min_games=2):
             pts_after = sum(lg.pts[p].get(w, 0) for w in after)
             homes = collections.Counter(next((lg.team[o] for (o, ww), ps in rostered.items() if ww == w and p in ps), "free agent") for w in after)
             now = next((lg.team[o] for o, ps in lg.roster_now.items() if p in ps), None)
-            out.append({"player": lg.name_of(p), "pos": lg.pos_of(p), "team": lg.team[r], "week": eff,
+            out.append({"player": lg.name_of(p), "pid": p, "pos": lg.pos_of(p), "team": lg.team[r], "week": eff,
                         "before_games": len(before), "before": sum(lg.pts[p].get(w, 0) for w in before),
                         "after_games": len(after), "after": pts_after,
                         "best": max((lg.pts[p].get(w, 0), w) for w in after),
@@ -752,12 +752,40 @@ def trades(lg):
         weeks = [w for w in lg.weeks if w >= eff]
         sides = []
         for r in t["roster_ids"]:
-            got = [{"player": lg.name_of(p), "pos": lg.pos_of(p), "since": sum(lg.pts.get(p, {}).get(w, 0) for w in weeks)}
+            got = [{"player": lg.name_of(p), "pid": p, "pos": lg.pos_of(p), "since": sum(lg.pts.get(p, {}).get(w, 0) for w in weeks)}
                    for p, rr in (t.get("adds") or {}).items() if rr == r]
-            picks = [f"{dp['season']} round {dp['round']} pick" for dp in (t.get("draft_picks") or []) if dp.get("owner_id") == r]
-            sides.append({"team": lg.team[r], "got": got, "picks": picks, "total": sum(g["since"] for g in got)})
+            pick_list = [{"season": str(dp["season"]), "round": dp["round"], "orig": lg.owner.get(dp.get("roster_id"))}
+                         for dp in (t.get("draft_picks") or []) if dp.get("owner_id") == r]
+            picks = []
+            for pk in pick_list:  # a pick from this season's draft already has a name on it
+                who = drafted_with(lg, pk) if pk["season"] == str(lg.season) else None
+                picks.append(f"{pk['season']} round {pk['round']} pick" + (f" ({lg.name_of(who)})" if who else ""))
+            sides.append({"team": lg.team[r], "got": got, "picks": picks, "pick_list": pick_list, "total": sum(g["since"] for g in got)})
         out.append({"weeks": weeks, "when": dt.datetime.fromtimestamp(t["status_updated"] / 1000, dt.timezone.utc), "sides": sides})
     return out
+
+
+def draft_slots(lg):
+    """[{round, orig (owner whose pick it originally was), pid, by (owner who made it)}] for this season's draft. The
+    draft's slot_to_roster_id says whose pick each slot was, so a traded pick can be matched to the player taken with it."""
+    if "_slots" in lg.__dict__:
+        return lg._slots
+    drafts = lg.client.league_drafts(lg.id)
+    out = []
+    if drafts:
+        d = lg.client.draft(drafts[0]["draft_id"])
+        slot_owner = {int(k): v for k, v in ((d.get("slot_to_roster_id") or {}).items())}
+        for p in lg.picks:
+            orig_roster = slot_owner.get(p.get("draft_slot"))
+            out.append({"round": p["round"], "orig": lg.owner.get(orig_roster), "pid": p["player_id"], "by": lg.owner.get(p.get("roster_id")),
+                        "pick_no": p["pick_no"]})
+    lg._slots = out
+    return out
+
+
+def drafted_with(lg, pk):
+    """The player taken with a traded pick {season, round, orig}, if that draft has happened in this league season."""
+    return next((x["pid"] for x in draft_slots(lg) if x["round"] == pk["round"] and x["orig"] == pk["orig"]), None)
 
 
 def draft(lg, window=15):
@@ -1062,7 +1090,9 @@ def season_summary(lg):
     trade_rows = []
     for t in trades(lg):
         sides = [{"owner": by_name.get(sd["team"]), "team": sd["team"], "total": round(sd["total"], 1), "picks": sd["picks"],
-                  "got": [{"player": g["player"], "pos": g["pos"], "since": round(g["since"], 1)} for g in sd["got"]]} for sd in t["sides"]]
+                  "pick_list": sd["pick_list"],
+                  "got": [{"player": g["player"], "pid": g["pid"], "pos": g["pos"], "since": round(g["since"], 1)} for g in sd["got"]]}
+                 for sd in t["sides"]]
         trade_rows.append({"week": t["weeks"][0] if t["weeks"] else None, "sides": sides})
     games = game_list(lg)
     pickups_ = sorted(pickups(lg), key=lambda a: -(a["total"] + a["after_trade"]))[:15]
@@ -1073,6 +1103,11 @@ def season_summary(lg):
         "big_games": big_games, "bench_weeks": bench_weeks, "startsit": start_sit(lg),
         "churn": churn(lg),
         "perfect_bids": perfect_bids(lg),
+        # every rostered player's regular-season points and games, and who each pick turned into: lets the all-time page
+        # follow trades, picks and drops into later seasons
+        "season_pts": {p: [round(sum(lg.pts[p].get(w, 0) for w in lg.weeks if p in lg.played[w]), 1), sum(1 for w in lg.weeks if p in lg.played[w])]
+                       for p in {p for w in lg.weeks for m in lg.matchups[w] for p in m.get("players") or []}},
+        "draft_slots": [dict(x, name=lg.name_of(x["pid"]), pos=lg.pos_of(x["pid"])) for x in draft_slots(lg)],
         "flex": {lg.owner[r]: _flex_totals(rows) for r, rows in flex_usage(lg).items()}, "lineups": score_lineups(lg),
         "draft": [{"owner": by_name.get(z["team"]), "team": z["team"], "round": z["round"], "pick": z["pick"], "player": z["player"],
                    "pos": z["pos"], "pts": round(z["pts"], 1), "value": round(z["value"], 1), "keeper": z["keeper"]} for z in draft(lg)],
@@ -1083,7 +1118,7 @@ def season_summary(lg):
         "pickups": [{"player": a["player"], "pos": a["pos"], "owner": by_name.get(a["team"]), "team": a["team"], "bid": a["bid"], "budget": a["budget"], "how": a["how"],
                      "traded_wk": a["traded_wk"], "traded_to": a["traded_to"], "after_trade": round(a["after_trade"], 1),
                      "games": a["games"], "total": round(a["total"], 1)} for a in pickups_],
-        "drops": [{"player": d["player"], "pos": d["pos"], "owner": by_name.get(d["team"]), "team": d["team"], "week": d["week"],
+        "drops": [{"player": d["player"], "pid": d["pid"], "pos": d["pos"], "owner": by_name.get(d["team"]), "team": d["team"], "week": d["week"],
                    "before": round(d["before"], 1), "after": round(d["after"], 1), "after_games": d["after_games"],
                    "before_games": d["before_games"], "gain": round(d["gain"], 2),
                    "started_elsewhere": round(d["started_elsewhere"], 1)} for d in drop_regrets(lg, top=15)],

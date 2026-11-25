@@ -546,7 +546,7 @@ def score_games_html(games, who, key, season_col=False, cutoff=100, mode="win"):
 def score_threshold_html(games, who, key, season_col=False, mode="win"):
     """score_games_html for a range of thresholds, with a menu that shows one at a time."""
     win = mode == "win"
-    cuts = [100, 95, 90, 85, 80] if win else [110, 115, 120, 125, 130]
+    cuts = config.WIN_CUTS if win else config.LOSS_CUTS
     sel = (f'<div class="hl-bar"><label for="{key}-cut">{"Wins under" if win else "Losses over"}</label>'
            f'<select id="{key}-cut" data-swap="{key}" autocomplete="off">'
            + "".join(f'<option value="{c}"{" selected" if i == 0 else ""}>{c} points</option>' for i, c in enumerate(cuts))
@@ -1918,22 +1918,62 @@ def alltime_sections(sums):
                    'pick in the same draft slot usually scored (median of picks within 15 spots). Round = the draft slot the keeper used.</p>') if keepers else '<div class="panel muted">No keepers found.</div>'
 
     # trades
+    # trades judged across seasons: what each side's players scored after the trade (the rest of that season plus every
+    # later season), and traded picks valued by the player drafted with them (his points from his rookie season on)
+    by_season = {x["season"]: x for x in sums}
+    later = lambda pid, season: sum((by_season[s_].get("season_pts") or {}).get(pid, [0, 0])[0] for s_ in by_season if s_ > season)
+    from_season = lambda pid, season: sum((by_season[s_].get("season_pts") or {}).get(pid, [0, 0])[0] for s_ in by_season if s_ >= season)
+
+    def resolve(pk):
+        x = by_season.get(pk["season"])
+        hit = next((d for d in (x or {}).get("draft_slots") or [] if d["round"] == pk["round"] and d["orig"] == pk["orig"]), None)
+        return hit
+
+    def value(sd, season):
+        total, parts = 0.0, []
+        for g in sd["got"]:
+            v_later = later(g.get("pid"), season) if g.get("pid") else 0
+            total += g["since"] + v_later
+            parts.append(f'{esc(g["player"])} <span class="muted">{g["since"]:.0f}' + (f' + {v_later:.0f} later' if v_later else '') + '</span>')
+        for pk in sd.get("pick_list") or []:
+            hit = resolve(pk)
+            label = f'{pk["season"]} R{pk["round"]}'
+            if hit:
+                v = from_season(hit["pid"], pk["season"])
+                total += v
+                parts.append(f'{label} pick <span class="muted">→</span> {esc(hit["name"])} <span class="muted">{v:.0f}</span>')
+            else:
+                parts.append(f'{label} pick <span class="muted">(not used yet)</span>')
+        if not sd.get("pick_list") and sd.get("picks"):
+            parts += [esc(p_) for p_ in sd["picks"]]
+        return total, ", ".join(parts) or '<span class="muted">nothing</span>'
+
     trades_ = []
     for x in sums:
         for t in x["trades"]:
             if len(t["sides"]) == 2:
-                a, b = sorted(t["sides"], key=lambda sd: -sd["total"])
-                trades_.append((a["total"] - b["total"], x["season"], t["week"], a, b))
+                vals = [(value(sd, x["season"]), sd) for sd in t["sides"]]
+                (va, a_), (vb, b_) = sorted(vals, key=lambda z: -z[0][0])
+                pending = any(not resolve(pk) for sd in t["sides"] for pk in sd.get("pick_list") or [])
+                trades_.append((va[0] - vb[0], x["season"], t["week"], (a_, va), (b_, vb), pending))
     trades_.sort(key=lambda z: -z[0])
-    def side(sd, cls):
-        got = ", ".join(f'{esc(g["player"])} <span class="muted">{g["since"]:.0f}</span>' for g in sd["got"]) or '<span class="muted">nothing</span>'
-        picks = (" + " + esc(", ".join(sd["picks"]))) if sd["picks"] else ""
-        return f'<div><b class="{cls}">{who(sd["owner"], sd["team"])}</b> <span class="muted">got</span> {got}{picks} <b>= {sd["total"]:.1f}</b></div>'
-    trade_html = ("".join(f'<div class="panel" style="margin-bottom:10px"><div class="muted" style="font-size:13px;margin-bottom:4px">'
-                          f'{season}{f", week {wk}" if wk else ""} · decided by <b class="neg">{gap:.1f}</b> points</div>'
-                          f'{side(a, "pos")}{side(b, "neg")}</div>' for gap, season, wk, a, b in trades_[:8])
-                  + '<p class="note">The most lopsided trades: points each side’s players scored for the rest of that regular season. '
-                    'Draft picks are listed but not scored.</p>') if trades_ else '<div class="panel muted">No trades yet.</div>'
+    def side(sv, cls):
+        sd, (total, text) = sv
+        return f'<div><b class="{cls}">{who(sd["owner"], sd["team"])}</b> <span class="muted">got</span> {text} <b>= {total:.1f}</b></div>'
+    card = lambda gap, season, wk, a_, b_, pending: (
+        f'<div class="panel" style="margin-bottom:10px"><div class="muted" style="font-size:13px;margin-bottom:4px">'
+        f'{season}{f", week {wk}" if wk else ""} · ahead by <b class="neg">{gap:.1f}</b> points so far</div>'
+        f'{side(a_, "pos")}{side(b_, "neg")}</div>')
+    settled = [t_ for t_ in trades_ if not t_[5]]
+    open_ = sorted((t_ for t_ in trades_ if t_[5]), key=lambda t_: (t_[1], t_[2] or 0), reverse=True)
+    trade_html = (("".join(card(*t_) for t_ in settled[:10]) or '<div class="panel muted">No settled trades yet.</div>')
+                  + (f'<h3 style="margin-top:18px">Still open: future picks not used yet</h3>'
+                     + "".join(card(*t_) for t_ in open_[:10]) if open_ else '')
+                  + '<p class="note">The most lopsided trades so far, judged across seasons: what the players each side got have scored since '
+                    'the trade (the rest of that regular season, plus every later regular season, wherever they played). A traded draft pick '
+                    'counts as the player drafted with it and what he has scored since. Trades with a pick that hasn\u2019t been used yet are '
+                    'listed separately, newest first: until that draft happens the pick counts as nothing, so they can still swing.</p>'
+                  ) if trades_ else '<div class="panel muted">No trades yet.</div>'
 
     # pickups and drops
     pick_val = lambda a: a["total"] + a.get("after_trade", 0)
@@ -1951,15 +1991,18 @@ def alltime_sections(sums):
                  f'<td>{who(d["owner"], d["team"])}</td><td class="n muted">wk {d["week"]}</td>'
                  f'<td class="n">{dppg(d["before"], d.get("before_games", 0)):.1f}</td>'
                  f'<td class="n">{dppg(d["after"], d["after_games"]):.1f}</td>'
-                 f'<td class="n team neg">+{d.get("gain", 0):.1f}</td></tr>' for d in drops_)
+                 f'<td class="n team neg">+{d.get("gain", 0):.1f}</td>'
+                 + (lambda v: f'<td class="n">{v:.0f}</td>' if v else '<td class="n muted">—</td>')(later(d.get("pid"), d["season"]) if d.get("pid") else 0)
+                 + '</tr>' for d in drops_)
     moves = (f'<div class="panel scroll"><h3 class="pos">Best pickups</h3><table><thead><tr><th>Season</th><th>Player</th><th>Picked up by</th>'
              f'<th class="n">Bid</th><th class="n">Games</th><th class="n">Points</th></tr></thead><tbody>{ph}</tbody></table></div>'
              f'<div class="panel scroll" style="margin-top:14px"><h3 class="neg">Worst drops</h3><table><thead><tr><th>Season</th><th>Player</th><th>Dropped by</th>'
-             f'<th class="n">Dropped</th><th class="n">Avg with them</th><th class="n">Avg since</th><th class="n">Regret per game</th></tr></thead><tbody>{dh}</tbody></table></div>'
+             f'<th class="n">Dropped</th><th class="n">Avg with them</th><th class="n">Avg since</th><th class="n">Regret per game</th><th class="n">Pts in later seasons</th></tr></thead><tbody>{dh}</tbody></table></div>'
              '<p class="note">Pickups: waiver claims and free-agent adds (FA in the Bid column), ranked by points scored for the team '
              'that picked him up, that season, plus, when that team flipped him in a trade, what he scored for the rest of the season after it. '
              'Drops: ranked by regret per game, what he averaged after the drop minus the higher of his average for that team and a '
-             'replacement-level starter at his position; at least 2 games after, kickers and defenses left out.</p>')
+             'replacement-level starter at his position; at least 2 games after, kickers and defenses left out. Pts in later seasons = what he scored in the seasons after the drop '
+             '(wherever he played): in dynasty a bad cut keeps hurting.</p>')
     # head to head
     h2h = collections.defaultdict(lambda: {"w": 0, "l": 0, "t": 0, "pf": 0.0, "pa": 0.0, "pw": 0, "pl": 0})
     for x in sums:
@@ -2174,35 +2217,56 @@ def alltime_sections(sums):
                    f'<th class="n">Longest losing streak</th><th></th><th class="n">Current</th></tr></thead><tbody>{"".join(strs)}</tbody></table></div>'
                    '<p class="note">Regular season and playoff games in order, carrying over from one season to the next.</p>')
 
-    # draft history
-    drafts = [(x["season"], d) for x in sums for d in x.get("draft", [])]
-    firsts = collections.defaultdict(list)
-    for y, d in drafts:
-        if d["round"] == 1 and d["owner"]:
-            firsts[d["owner"]].append((y, d))
-    classes = collections.defaultdict(float)
-    for y, d in drafts:
-        if d["owner"] and not d["keeper"]:
-            classes[(y, d["owner"])] += d["value"]
+    # draft history: every draft judged by what its picks have scored since, across seasons (the first dynasty season's
+    # draft is the startup; every later one is a rookie draft)
+    first_season = min(x["season"] for x in sums)
+    dclass = collections.defaultdict(list)  # season -> [pick rows with points since]
+    for x in sums:
+        for d in x.get("draft_slots") or []:
+            dclass[x["season"]].append(dict(d, since=from_season(d["pid"], x["season"])))
+    for y, rows in dclass.items():  # value vs slot: points since minus the median of picks within 6 spots
+        pts = sorted(rows, key=lambda d: d["pick_no"])
+        for d in pts:
+            near = sorted(e["since"] for e in pts if abs(e["pick_no"] - d["pick_no"]) <= 6)
+            d["value"] = d["since"] - near[len(near) // 2]
+    kind = lambda y: "startup" if y == first_season else "rookie"
     ftr = []
-    for o in sorted(owners, key=lambda o: -sum(d["value"] for _, d in firsts[o])):
+    seasons_d = sorted(dclass)
+    for o in sorted(owners, key=lambda o: -sum(d["value"] for y in seasons_d for d in dclass[y] if d["by"] == o and d["round"] == 1)):
         cells = []
-        for x in sums:
-            ds = [d for y, d in firsts[o] if y == x["season"]]
-            cells.append("<td>" + ("".join(f'<div><b>{esc(d["player"])}</b>{" <span class=star title=keeper>★</span>" if d["keeper"] else ""} '
-                                           f'<span class="muted">#{d["pick"]}</span> <span class="{"pos" if d["value"] >= 0 else "neg"}" style="font-size:12px">'
-                                           f'{signed(d["value"], 0)}</span></div>' for d in ds) or '<span class="muted">—</span>') + "</td>")
-        tot = sum(d["value"] for _, d in firsts[o])
+        for y in seasons_d:
+            ds = [d for d in dclass[y] if d["by"] == o and d["round"] == 1]
+            cells.append("<td>" + ("".join(f'<div><b>{esc(d["name"])}</b> <span class="muted">#{d["pick_no"]} · {d["since"]:.0f} pts</span> '
+                                           f'<span class="{"pos" if d["value"] >= 0 else "neg"}" style="font-size:12px">{signed(d["value"], 0)}</span></div>'
+                                           for d in ds) or '<span class="muted">traded</span>') + "</td>")
+        tot = sum(d["value"] for y in seasons_d for d in dclass[y] if d["by"] == o and d["round"] == 1)
         ftr.append(f'<tr><td>{who(o)}</td>{"".join(cells)}<td class="n team {"pos" if tot >= 0 else "neg"}">{signed(tot, 0)}</td></tr>')
-    best_cls = sorted(classes.items(), key=lambda kv: -kv[1])[:5]
-    worst_cls = sorted(classes.items(), key=lambda kv: kv[1])[:5]
-    cls_fmt = lambda kv: f'<td>{who(kv[0][1])}<div class="muted" style="font-size:12px">{kv[0][0]} draft</div></td><td class="n team {"pos" if kv[1] >= 0 else "neg"}">{signed(kv[1], 0)}</td>'
+    classes = collections.defaultdict(lambda: [0.0, 0.0, 0])  # (season, owner) -> [points since, value vs slot, picks]
+    for y in seasons_d:
+        for d in dclass[y]:
+            if d["by"]:
+                c = classes[(y, d["by"])]
+                c[0] += d["since"]
+                c[1] += d["value"]
+                c[2] += 1
+    def cls_list(title, items, cls):
+        return lst(title, items, lambda kv: f'<td>{who(kv[0][1])}<div class="muted" style="font-size:12px">{kv[0][0]} {kind(kv[0][0])} draft · '
+                                            f'{kv[1][2]} picks · {kv[1][0]:,.0f} pts</div></td><td class="n team {"pos" if kv[1][1] >= 0 else "neg"}">'
+                                            f'{signed(kv[1][1], 0)}</td>', cls)
+    rookie = [kv for kv in classes.items() if kind(kv[0][0]) == "rookie"]
+    startup = [kv for kv in classes.items() if kind(kv[0][0]) == "startup"]
     draft_html = (f'<div class="panel scroll"><table style="font-size:14px"><thead><tr><th>Manager</th>'
-                  + "".join(f'<th>{x["season"]} 1st round</th>' for x in sums) + '<th class="n">Total vs. slot</th></tr></thead>'
+                  + "".join(f'<th>{y} {kind(y)} 1st round</th>' for y in seasons_d) + '<th class="n">Total vs. slot</th></tr></thead>'
                   f'<tbody>{"".join(ftr)}</tbody></table></div>'
-                  f'<div class="grid2" style="margin-top:14px">{lst("Best draft classes", best_cls, cls_fmt, "pos")}{lst("Worst draft classes", worst_cls, cls_fmt, "neg")}</div>'
-                  '<p class="note">Value = a pick’s regular-season points that year minus what picks in the same draft slot usually score. '
-                  'Draft classes add up every non-keeper pick. ★ = keeper using a first-round slot. The current season counts points so far.</p>')
+                  '<div class="grid2" style="margin-top:14px">'
+                  + cls_list("Best rookie classes", sorted(rookie, key=lambda kv: -kv[1][1])[:5], "pos")
+                  + cls_list("Worst rookie classes", sorted(rookie, key=lambda kv: kv[1][1])[:5], "neg")
+                  + cls_list("Startup draft: best", sorted(startup, key=lambda kv: -kv[1][1])[:5], "pos")
+                  + cls_list("Startup draft: worst", sorted(startup, key=lambda kv: kv[1][1])[:5], "neg") + '</div>'
+                  f'<p class="note">Every pick is judged by the regular-season points the player has scored since he was drafted, through every '
+                  f'season to date (wherever he played), against what picks within six spots of it in the same draft have scored. {first_season} '
+                  'was the startup draft; every draft after it is a rookie draft, and rookies take time, so those numbers grow every season. '
+                  'A class = every pick a manager made in that draft (traded picks count for whoever made them).</p>')
 
     # manager tendencies
     tcount, partners, tnet = collections.Counter(), collections.defaultdict(collections.Counter), collections.Counter()
@@ -2336,17 +2400,16 @@ def alltime_sections(sums):
         ltrs.append(f'<tr class="xrow" tabindex="0" role="button" aria-expanded="false" aria-controls="loy-{i}" '
                     f'data-n="{len(multi)}" data-share="{share:.4f}" data-kept="{nkept}" data-long="{longest["weeks"] if longest else 0}">'
                     f'<td class="muted rank"></td><td><span class="chev" aria-hidden="true">▸</span> {who(o)}</td>'
-                    f'<td class="n team">{len(multi)}</td><td class="n">{share:.0%}</td><td class="n">{nkept}</td>'
+                    f'<td class="n team">{len(multi)}</td><td class="n">{share:.0%}</td>'
                     f'<td style="white-space:nowrap">{long_txt}</td></tr>'
-                    f'<tr class="xdetail" id="loy-{i}" hidden><td colspan="6"><table class="picks"><tr><td class="muted">Player</td>'
+                    f'<tr class="xdetail" id="loy-{i}" hidden><td colspan="5"><table class="picks"><tr><td class="muted">Player</td>'
                     f'<td class="n muted">Weeks on roster</td><td class="n muted">Share</td><td class="n muted">Weeks started</td>'
                     f'<td class="n muted">Pts as a starter</td><td class="muted">Seasons</td></tr>{det}</table></td></tr>')
     lcontrols = _sort_controls("loyal", [("n", "Repeat players", "Most players carried across seasons first"),
                                          ("share", "Share of roster weeks", "Most roster time from repeat players first"),
-                                         ("long", "Longest tenure", "Longest-held player first"),
-                                         ("kept", "Keepers used", "Most keepers first")])
+                                         ("long", "Longest tenure", "Longest-held player first")])
     loyalty = (f'<div class="panel scroll sortbars">{lcontrols}<table class="expand"><thead><tr><th></th><th>Manager</th>'
-               f'<th class="n">Repeat players</th><th class="n">Roster weeks from them</th><th class="n">Keepers used</th>'
+               f'<th class="n">Repeat players</th><th class="n">Roster weeks from them</th>'
                f'<th>Longest-held player</th></tr></thead><tbody>{"".join(ltrs)}</tbody></table></div>')
     every = sorted(((o, pid, h) for o, ps in held.items() for pid, h in ps.items() if len(h["seasons"]) >= 2),
                    key=lambda t: -t[2]["weeks"])[:15]
@@ -2358,7 +2421,7 @@ def alltime_sections(sums):
                 f'<th>Manager</th><th class="n">Weeks on roster</th><th>Seasons</th></tr></thead><tbody>{btrs}</tbody></table></div>'
                 '<p class="note">Regular-season weeks a player spent on a manager’s roster, starting or on the bench, out of all the regular-season weeks '
                 'that manager has played since 2025 (this season so far included). Repeat players = on the same manager’s roster in at least two '
-                'seasons; team defenses count too. ★ marks the seasons a player was a keeper for that manager. Weeks started and points as a starter count only weeks he was in that '
+                'seasons; team defenses count too. Taxi and IR weeks count as roster weeks. Weeks started and points as a starter count only weeks he was in that '
                 'manager’s starting lineup. Click a manager for his players.</p>')
 
     # best single-game player scores and worst bench weeks
@@ -2723,7 +2786,7 @@ def alltime_sections(sums):
             ("finishes", "Where everyone finished", finishes), ("champions", "Champions and last places", champs),
             ("playoff-records", "Playoff records", playoffs_html), ("record-book", "Record book", record_book),
             ("big-games", "Best single-game performances", big_games_html), ("bench-disasters", "Biggest bench disasters", bench_html),
-            ("luck", "All-time luck", luck_html), ("injury-luck", "Injury luck", injury_html), ("sub100", "Low-scoring wins", sub100_at), ("highloss", "High-scoring losses", highloss_at), ("streaks", "Streaks", streak_html), ("keepers", "Keepers", keep_html),
+            ("luck", "All-time luck", luck_html), ("injury-luck", "Injury luck", injury_html), ("sub100", "Low-scoring wins", sub100_at), ("highloss", "High-scoring losses", highloss_at), ("streaks", "Streaks", streak_html),
             ("draft-history", "Draft history", draft_html), ("alltime-trades", "Most lopsided trades", trade_html),
             ("tendencies", "Manager tendencies", tendencies), ("alltime-flex", "Flex usage", flex_html), ("alltime-sources", "Drafted vs. picked up", sources_html), ("alltime-carry", "Who carried each team", carry_html), ("by-week", "By week of the season", by_week_html), ("alltime-overbids", "Waiver overbids", overbids), ("alltime-perfect-bids", "Perfect bids", perfect_html),
             ("loyalty", "Who sticks with their guys", loyalty),
