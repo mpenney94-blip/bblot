@@ -1,0 +1,91 @@
+name: League dashboard
+
+on:
+  # GitHub schedules run in UTC, so each run is listed for both daylight time (PDT) and standard time (PST);
+  # the "Check the Pacific time" step below lets only the one matching the current clock through.
+  schedule:
+    - cron: "0 11 * * 2"  # Tuesday 4am PDT: the week's results, recap and next-week preview
+    - cron: "0 12 * * 2"  # Tuesday 4am PST
+    - cron: "0 19 * * 4"  # Thursday noon PDT: stat corrections, fresh projections and preview (recap is kept)
+    - cron: "0 20 * * 4"  # Thursday noon PST
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ["dashboard/**", "sleeper.py", "winprob.py", ".github/workflows/dashboard.yml"]
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  LEAGUE_ID: "1330268610945376256"  # Boys Boys Lots of Toys (dynasty)
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    outputs:
+      run: ${{ steps.tz.outputs.run }}
+    steps:
+      - name: Check the Pacific time
+        id: tz
+        run: |
+          zone=$(TZ=America/Los_Angeles date +%Z)
+          case "${{ github.event.schedule }}" in
+            "0 11 * * 2"|"0 19 * * 4") want=PDT ;;
+            "0 12 * * 2"|"0 20 * * 4") want=PST ;;
+            *) want=$zone ;;  # pushes and manual runs always build
+          esac
+          echo "run=$([ "$zone" = "$want" ] && echo yes || echo no)" >> "$GITHUB_OUTPUT"
+          echo "Pacific is on $zone; this trigger is for $want"
+
+  build:
+    needs: gate
+    if: needs.gate.outputs.run == 'yes'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Anthropic SDK (for the written columns)
+        run: pip install anthropic
+      - name: Restore finished seasons
+        uses: actions/cache@v4
+        with:
+          path: _past
+          # finished seasons never change, so they're rebuilt only when the code or the current league does
+          key: past-${{ env.LEAGUE_ID }}-${{ hashFiles('dashboard/**', 'winprob.py', 'sleeper.py') }}
+      - name: Restore written columns
+        uses: actions/cache@v4
+        with:
+          path: .cache/commentary
+          # a fresh key each run so new columns get saved; restore-keys picks up the last run's
+          key: commentary-${{ github.run_id }}
+          restore-keys: commentary-
+      - name: Build site
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}  # optional: without it the built-in writer does the trash talk
+          # scheduled and manual runs may rewrite the live preview; code pushes reuse what's there
+          COMMENTARY_REFRESH: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && '1' || '0' }}
+          # the all-time rivalry column is rewritten once a week, on the Tuesday run
+          RIVALRY_REFRESH: ${{ (github.event_name == 'schedule' && contains(github.event.schedule, '* * 2')) && '1' || '0' }}
+        run: python -m dashboard.build "$LEAGUE_ID" --out _site --past-cache _past
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

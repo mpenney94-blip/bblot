@@ -1,0 +1,962 @@
+"""Week-to-week stats: playoff odds, power rankings, awards, next-week preview, projections, close games, trends,
+plus the season-long position-strength, bye and injury views."""
+
+import collections
+import math
+import random
+import re
+import statistics as st
+
+import winprob
+from dashboard import config
+from dashboard.stats import _optimal, perfect_lineup
+
+POSITIONS = ["QB", "RB", "WR", "TE", "K", "DEF"]
+
+
+def _scores(lg, weeks):
+    return {w: {m["roster_id"]: m["points"] or 0.0 for m in lg.matchups[w]} for w in weeks}
+
+
+def _pairs(lg, w):
+    by = collections.defaultdict(list)
+    for m in lg.matchups_for(w):
+        if m.get("matchup_id") is not None:
+            by[m["matchup_id"]].append(m["roster_id"])
+    return [tuple(v) for v in by.values() if len(v) == 2]
+
+
+# ---------------------------------------------------------------- playoff odds
+def playoff_odds(lg, through=None, sims=10000, seed=7):
+    """Monte Carlo the rest of the regular season. Through = last week counted as played (default: last scored)."""
+    through = through or lg.weeks[-1]
+    played = [w for w in lg.weeks if w <= through and w in lg.reg_weeks]
+    left = [w for w in lg.reg_weeks if w > through]
+    sc = _scores(lg, played)
+    rids = list(lg.team)
+    wins0 = {r: 0.0 for r in rids}
+    pf0 = {r: 0.0 for r in rids}
+    for w in played:
+        for a, b in _pairs(lg, w):
+            wins0[a] += 1 if sc[w][a] > sc[w][b] else .5 if sc[w][a] == sc[w][b] else 0
+            wins0[b] += 1 if sc[w][b] > sc[w][a] else .5 if sc[w][a] == sc[w][b] else 0
+        for r in rids:
+            pf0[r] += sc[w][r]
+    allv = [v for w in played for v in sc[w].values()]
+    lg_mean, lg_sd = st.mean(allv), st.pstdev(allv)
+    mu, sd = {}, {}
+    for r in rids:
+        v = [sc[w][r] for w in played]
+        k = len(v)
+        mu[r] = (sum(v) + 3 * lg_mean) / (k + 3)  # shrink toward the league average early in the season
+        sd[r] = math.sqrt(((st.pstdev(v) ** 2) * k + lg_sd ** 2 * 3) / (k + 3)) if k else lg_sd
+    sched = {w: _pairs(lg, w) for w in left}
+    divs = collections.defaultdict(list)
+    for r in rids:
+        divs[lg.division.get(r)].append(r)
+    n_po = lg.playoff_teams
+    n_bye = len([d for d in divs if d is not None]) if n_po and len(divs) > 1 else (2 if n_po >= 6 else 0)
+    rng = random.Random(seed)
+    tally = {r: collections.Counter() for r in rids}
+    for _ in range(sims):
+        wins, pf = dict(wins0), dict(pf0)
+        for w in left:
+            draw = {r: rng.gauss(mu[r], sd[r]) for r in rids}
+            for a, b in sched[w]:
+                wins[a if draw[a] > draw[b] else b] += 1
+            for r in rids:
+                pf[r] += draw[r]
+        key = lambda r: (wins[r], pf[r])
+        order = sorted(rids, key=key, reverse=True)
+        if len(divs) > 1 and None not in divs:
+            # league rules (config.PLAYOFF_FORMAT): each division winner is in with a bye, then the best remaining
+            # records regardless of division fill the other spots; every tie goes to points for
+            ranked = {d: sorted(m, key=key, reverse=True) for d, m in divs.items()}
+            winners = sorted((m[0] for m in ranked.values()), key=key, reverse=True)
+            rest = [r for r in order if r not in winners]
+            seeds = winners + rest
+        else:
+            seeds = order
+        for i, r in enumerate(seeds):
+            t = tally[r]
+            t["wins"] += wins[r]
+            if i < n_po:
+                t["playoffs"] += 1
+            if i < n_bye:
+                t["bye"] += 1
+            if i == 0:
+                t["first"] += 1
+        tally[order[-1]]["last"] += 1
+    clinch = _clinched(lg, wins0, pf0, sched, n_po, divs)
+    out = []
+    for r in rids:
+        t = tally[r]
+        out.append({"team": lg.team[r], "rid": r, "wins": wins0[r], "losses": len(played) - wins0[r], "pf": pf0[r], **clinch[r],
+                    "playoffs": t["playoffs"] / sims, "bye": t["bye"] / sims, "first": t["first"] / sims,
+                    "last": t["last"] / sims, "proj_wins": t["wins"] / sims, "division": lg.division.get(r)})
+    return sorted(out, key=lambda x: (-x["playoffs"], -x["bye"], -x["proj_wins"]))
+
+
+def _misses(d, o, n_po, n_div):
+    """Can a team miss the playoffs with d division-mates and o teams from the other division finishing ahead of it?
+    Division winners are in, then the best remaining records regardless of division. To miss, a division-mate must be
+    ahead (so it isn't the winner) and the remaining spots must all go to non-winners ahead of it: its d - 1 other
+    division-mates ahead, plus the o - 1 from the other division ahead beyond that division's winner."""
+    wild = n_po - n_div
+    if d < 1:
+        return False
+    return (d - 1) + max(o - 1, 0) >= wild
+
+
+def _clinched(lg, wins0, pf0, sched, n_po, divs):
+    """Mathematical clinches and eliminations: worst case (lose out, every rival wins out, ties go against) and best case."""
+    left = collections.Counter(r for games in sched.values() for pair in games for r in pair)
+    out = {}
+    two_divs = len(divs) == 2 and None not in divs
+    for r in wins0:
+        lo, hi = wins0[r], wins0[r] + left[r]
+        mates = [x for x in divs.get(lg.division.get(r), []) if x != r]
+        others = [x for x in wins0 if x != r and x not in mates]
+        settled = lambda x: not left[r] and not left[x]       # both done: a tie in wins is already decided on points
+        can_pass = lambda x: (wins0[x], pf0[x]) > (lo, pf0[r]) if settled(x) else wins0[x] + left[x] >= lo  # could finish ahead
+        sure_ahead = lambda x: (wins0[x], pf0[x]) > (hi, pf0[r]) if settled(x) else wins0[x] > hi          # ahead even if it wins out
+        if two_divs:
+            po = not _misses(sum(map(can_pass, mates)), sum(map(can_pass, others)), n_po, len(divs))
+            out_ = _misses(sum(map(sure_ahead, mates)), sum(map(sure_ahead, others)), n_po, len(divs))
+            bye = not any(map(can_pass, mates))
+        else:
+            po = sum(can_pass(x) for x in wins0 if x != r) < n_po
+            out_ = sum(sure_ahead(x) for x in wins0 if x != r) >= n_po
+            bye = False
+        out[r] = {"clinched": po, "clinched_bye": bye, "eliminated": out_}
+    return out
+
+
+# ---------------------------------------------------------------- power rankings
+def power(lg, through=None):
+    through = through or lg.weeks[-1]
+    weeks = [w for w in lg.weeks if w <= through]
+    sc = _scores(lg, weeks)
+    rows = []
+    for r in lg.team:
+        ap_w = sum(sum(1 for o, v in sc[w].items() if o != r and sc[w][r] > v) + .5 * sum(1 for o, v in sc[w].items() if o != r and sc[w][r] == v)
+                   for w in weeks)
+        ap = ap_w / (len(weeks) * (len(lg.team) - 1))
+        ppg = st.mean(sc[w][r] for w in weeks)
+        recent = st.mean(sc[w][r] for w in weeks[-3:])
+        rows.append({"rid": r, "team": lg.team[r], "allplay": ap, "ppg": ppg, "recent": recent})
+    def pct(key):
+        vals = sorted(x[key] for x in rows)
+        return {x["rid"]: (sum(1 for v in vals if v < x[key]) + .5 * (sum(1 for v in vals if v == x[key]) - 1)) / (len(vals) - 1) for x in rows}
+    p_ppg, p_rec = pct("ppg"), pct("recent")
+    for x in rows:
+        x["score"] = 100 * (.5 * x["allplay"] + .25 * p_ppg[x["rid"]] + .25 * p_rec[x["rid"]])
+    rows.sort(key=lambda x: -x["score"])
+    for i, x in enumerate(rows, 1):
+        x["rank"] = i
+    return rows
+
+
+# ---------------------------------------------------------------- weekly awards
+def awards(lg, w, wp=None):
+    ms = lg.matchups[w]
+    sc = {m["roster_id"]: m["points"] or 0.0 for m in ms}
+    pairs = _pairs(lg, w)
+    res = [(a, b) if sc[a] >= sc[b] else (b, a) for a, b in pairs]  # (winner, loser)
+    out = {}
+    lw = min(res, key=lambda p: sc[p[0]])
+    out["luckiest"] = (lg.team[lw[0]], sc[lw[0]], f"won with the week’s lowest winning score, over {lg.team[lw[1]]} ({sc[lw[1]]:.2f})")
+    ul = max(res, key=lambda p: sc[p[1]])
+    out["unluckiest"] = (lg.team[ul[1]], sc[ul[1]], f"lost anyway, to {lg.team[ul[0]]} ({sc[ul[0]]:.2f})")
+    eff = {}
+    for m in ms:
+        opt, used = _optimal(lg, m.get("players_points") or {})
+        eff[m["roster_id"]] = (sc[m["roster_id"]] / opt if opt else 1, opt - sc[m["roster_id"]], m, used)
+    share = {r: 1.0 if e[1] < .05 else round(e[0], 4) for r, e in eff.items()}  # ties count, perfect lineups all share 100%
+    top = max(share.values())
+    best = sorted((r for r in eff if share[r] == top), key=lambda r: -sc[r])
+    gap = max(eff[r][1] for r in best)
+    out["best_call"] = (", ".join(lg.team[r] for r in best), top,
+                        ("each " if len(best) > 1 else "") + ("started its best possible lineup" if top == 1.0
+                                                               else f"left only {gap:.1f} points on the bench"))
+    worst = max(eff, key=lambda r: eff[r][1])
+    _, gap, m, used = eff[worst]
+    benched = max((p for p in used if p not in m["starters"]), key=lambda p: m["players_points"][p], default=None)
+    out["worst_call"] = (lg.team[worst], gap, f"left {gap:.1f} points on the bench"
+                         + (f", including {lg.name_of(benched)} ({m['players_points'][benched]:.1f})" if benched else ""))
+    top = max(((lg.name_of(p), v, lg.team[m["roster_id"]]) for m in ms for p, v in zip(m["starters"], m["starters_points"]) if p != "0"),
+              key=lambda x: x[1])
+    out["player"] = (top[0], top[1], f"for {top[2]}")
+    bench = max(((lg.name_of(p), v, lg.team[m["roster_id"]]) for m in ms for p, v in (m.get("players_points") or {}).items() if p not in m["starters"]),
+                key=lambda x: x[1], default=None)
+    if bench:
+        out["bench"] = (bench[0], bench[1], f"sat on {bench[2]}’s bench")
+    perfect = [lg.team[m["roster_id"]] for m in ms if perfect_lineup(lg, m)]
+    out["perfect"] = (", ".join(perfect) if perfect else "Nobody", len(perfect),
+                      "each set one" if len(perfect) > 1 else "set one")
+    if wp:
+        ups = []
+        for mm in wp["matchups"]:
+            pre, last = mm["series"][0], mm["series"][-1]
+            home_won = last[2] >= last[3]
+            p_win = pre[1] if home_won else 1 - pre[1]
+            ups.append((p_win, mm["home"]["team"] if home_won else mm["away"]["team"], mm["away"]["team"] if home_won else mm["home"]["team"]))
+        u = min(ups)
+        out["upset"] = (u[1], u[0], f"won after starting with a {u[0]:.0%} chance against {u[2]}")
+    return out
+
+
+# ---------------------------------------------------------------- next week preview
+def preview(lg, w):
+    if w not in lg.reg_weeks and (not lg.playoff_start or w >= lg.playoff_start + 3):
+        return []
+    ms = {m["roster_id"]: m for m in lg.matchups_for(w)}
+    proj, _ = lg.proj(w)
+    games = []
+    for a, b in _pairs(lg, w):
+        side = []
+        for r in (a, b):
+            m = ms[r]
+            starters = [p for p in (m.get("starters") or []) if p and p != "0"]
+            if not starters:  # no lineup set yet: use the best projected lineup
+                _, starters = _optimal(lg, {p: proj.get(p, 0) for p in lg.roster_now.get(r, [])})
+            pts = sum(proj.get(p, 0) for p in starters)
+            var = sum(winprob.player_sd(proj.get(p, 0), lg.pos_of(p)) ** 2 for p in starters)
+            key = max(starters, key=lambda p: proj.get(p, 0), default=None)
+            out_ = [lg.name_of(p) for p in starters if proj.get(p, 0) <= 0]
+            side.append({"team": lg.team[r], "proj": pts, "var": var, "key": (lg.name_of(key), proj.get(key, 0)) if key else None, "empty": out_})
+        sd = math.sqrt(side[0]["var"] + side[1]["var"]) or 1
+        pa = .5 * (1 + math.erf((side[0]["proj"] - side[1]["proj"]) / (sd * math.sqrt(2))))
+        if pa < .5:
+            side, pa = side[::-1], 1 - pa
+        games.append({"fav": side[0], "dog": side[1], "p": pa, "spread": side[0]["proj"] - side[1]["proj"]})
+    return sorted(games, key=lambda g: g["p"])
+
+
+# ---------------------------------------------------------------- vs projections
+def vs_projection(lg):
+    teams = {r: {"team": n, "act": 0.0, "proj": 0.0, "last_act": 0.0, "last_proj": 0.0} for r, n in lg.team.items()}
+    players = collections.defaultdict(lambda: {"act": 0.0, "proj": 0.0, "starts": 0, "team": None})
+    last = lg.weeks[-1]
+    for w in lg.weeks:
+        proj, _ = lg.proj(w)
+        for m in lg.matchups[w]:
+            t = teams[m["roster_id"]]
+            for p, v in zip(m["starters"], m["starters_points"]):
+                if p == "0":
+                    continue
+                pj = proj.get(p, 0.0)
+                t["act"] += v
+                t["proj"] += pj
+                if w == last:
+                    t["last_act"] += v
+                    t["last_proj"] += pj
+                pl = players[(p, m["roster_id"])]
+                pl["act"] += v
+                pl["proj"] += pj
+                pl["starts"] += 1
+                pl["team"] = t["team"]
+    rows = sorted(teams.values(), key=lambda t: -(t["act"] - t["proj"]))
+    pls = [{"player": lg.name_of(p), "team": v["team"], "starts": v["starts"], "diff": v["act"] - v["proj"], "act": v["act"], "proj": v["proj"]}
+           for (p, _), v in players.items() if v["starts"] >= 2]
+    pls.sort(key=lambda x: -x["diff"])
+    return rows, pls[:6], pls[::-1][:6]
+
+
+# ---------------------------------------------------------------- close games
+def close_games(lg, margin=10):
+    rec = {r: [0, 0] for r in lg.team}
+    nail = []
+    for w in lg.weeks:
+        sc = {m["roster_id"]: m["points"] or 0.0 for m in lg.matchups[w]}
+        for a, b in _pairs(lg, w):
+            d = abs(sc[a] - sc[b])
+            if d < margin:
+                win, lose = (a, b) if sc[a] > sc[b] else (b, a)
+                rec[win][0] += 1
+                rec[lose][1] += 1
+                nail.append({"week": w, "winner": lg.team[win], "loser": lg.team[lose], "ws": sc[win], "ls": sc[lose], "margin": d})
+    rows = sorted(({"team": lg.team[r], "w": v[0], "l": v[1]} for r, v in rec.items()),
+                  key=lambda x: (-(x["w"] - x["l"]), -x["w"]))
+    return rows, sorted(nail, key=lambda g: g["margin"])
+
+
+# ---------------------------------------------------------------- scoring trends
+def trends(lg, window=3):
+    out = []
+    for r, name in lg.team.items():
+        pts = [next(m["points"] or 0.0 for m in lg.matchups[w] if m["roster_id"] == r) for w in lg.weeks]
+        roll = [st.mean(pts[max(0, i - window + 1):i + 1]) for i in range(len(pts))]
+        out.append({"team": name, "pts": pts, "roll": roll, "season": st.mean(pts), "recent": roll[-1]})
+    league = [st.mean(next(m["points"] or 0.0 for m in lg.matchups[w] if m["roster_id"] == r) for r in lg.team) for w in lg.weeks]
+    return sorted(out, key=lambda x: -(x["recent"] - x["season"])), league
+
+
+# ---------------------------------------------------------------- position strength (season)
+def position_strength(lg):
+    tot = {r: collections.Counter() for r in lg.team}
+    for w in lg.weeks:
+        for m in lg.matchups[w]:
+            for p, v in zip(m["starters"], m["starters_points"]):
+                if p != "0":
+                    tot[m["roster_id"]][lg.pos_of(p) or "?"] += v
+    n = len(lg.weeks)
+    rows = [{"team": lg.team[r], "ppg": {pos: tot[r][pos] / n for pos in POSITIONS}} for r in lg.team]
+    for pos in POSITIONS:
+        ranked = sorted(rows, key=lambda x: -x["ppg"][pos])
+        for i, x in enumerate(ranked, 1):
+            x.setdefault("rank", {})[pos] = i
+    avg = {pos: st.mean(x["ppg"][pos] for x in rows) for pos in POSITIONS}
+    for x in rows:
+        x["avg_rank"] = st.mean(x["rank"].values())
+    return sorted(rows, key=lambda x: x["avg_rank"]), avg
+
+
+# ---------------------------------------------------------------- byes and injuries (season)
+def _ppg(lg):
+    games = collections.Counter(p for w in lg.weeks for p in lg.played[w])
+    return {p: sum(lg.pts[p].get(w, 0) for w in lg.weeks if p in lg.played[w]) / n for p, n in games.items()}
+
+
+def _nfl_team(lg, p, w=None):
+    if p.isalpha():
+        return p
+    return (lg.proj(w)[1].get(p) if w else None) or (lg.players.get(p) or {}).get("team")
+
+
+def byes(lg, min_ppg=8.0):
+    """Season averages of contributors lost to byes so far, and still to come for the current roster."""
+    ppg = _ppg(lg)
+    out = []
+    for r, name in lg.team.items():
+        past, future = [], []
+        for w in lg.weeks:
+            m = next(m for m in lg.matchups[w] if m["roster_id"] == r)
+            for p in m.get("players") or []:
+                if ppg.get(p, 0) >= min_ppg and p not in lg.played[w] and _nfl_team(lg, p, w) in lg.bye.get(w, set()):
+                    past.append((w, lg.name_of(p), ppg[p]))
+        for w in (x for x in lg.reg_weeks if x >= lg.next_week):
+            for p in lg.roster_now.get(r, ()):
+                if ppg.get(p, 0) >= min_ppg and _nfl_team(lg, p) in lg.bye.get(w, set()):
+                    future.append((w, lg.name_of(p), ppg[p]))
+        out.append({"team": name, "past": sorted(past), "future": sorted(future),
+                    "lost": sum(v for *_, v in past), "to_come": sum(v for *_, v in future)})
+    return sorted(out, key=lambda x: -(x["lost"] + x["to_come"]))
+
+
+_INJ = re.compile(r"([A-Z]{2,3})-((?:[A-Z][a-z]?\.)?[A-Z][\w'.-]*(?: [A-Z][\w'.-]+)*) (was injured during the play|has returned to the game)")
+
+
+def game_plays(lg, w):
+    """[(game, plays)] for every NFL game in week w, from ESPN's play-by-play. Fetched once per build and shared."""
+    cache = lg.__dict__.setdefault("_plays", {})
+    if w not in cache:
+        out = []
+        for g in winprob.espn_games(lg.season, w):
+            try:
+                items, page = [], 1
+                while True:
+                    d = winprob._fetch(winprob.ESPN_PLAYS.format(id=g["id"], page=page))
+                    items += d["items"]
+                    if page >= d.get("pageCount", 1):
+                        break
+                    page += 1
+            except Exception as e:  # one bad game shouldn't sink the page
+                print(f"plays for {g['name']} failed: {e}")
+                continue
+            out.append((g, sorted(items, key=lambda p: int(p["sequenceNumber"]))))
+        cache[w] = out
+    return cache[w]
+
+
+def injury_exits(lg, w):
+    """{(espn name token like 'E.Arroyo', game's teams)} for players who got hurt during a play in week w and never came back."""
+    hurt = set()
+    for g, items in game_plays(lg, w):
+        state = {}  # name -> still out?  Any later mention in a play (not an injury note) means he came back.
+        for pl in items:
+            text = pl.get("text") or ""
+            plain = re.sub(r"\*\* Injury Update:.*", "", _INJ.sub("", text))
+            for n in [n for n, out in state.items() if out and re.search(rf"(?<![\w.]){re.escape(n)}\b", plain)]:
+                state[n] = False
+            for m in _INJ.finditer(text):
+                state[m.group(2)] = m.group(3).startswith("was")
+        hurt |= {(n, tuple(g["teams"])) for n, out in state.items() if out}
+    return hurt
+
+
+def _matches(lg, p, token):
+    first, _, last = token.partition(".")
+    info = lg.players.get(p) or {}
+    norm = lambda x: "".join(ch for ch in x.lower() if ch.isalnum())
+    return norm(info.get("last_name") or "") == norm(last) and (info.get("first_name") or "").lower().startswith(first.lower())
+
+
+HURT = {"IR": "injured reserve", "Out": "out", "PUP": "PUP list", "Doubtful": "doubtful"}
+
+
+def dropped_hurt(lg, r, ppg, exits, min_ppg=8.0):
+    """Players team r cut while hurt, and what they would have scored for it afterwards. Hurt at the cut = in the last week
+    he was on the roster he either sat out while his NFL team played, or left the game hurt and didn't return. From then on
+    every game his NFL team plays without him costs his season average, until he plays again (or rejoins the team, when
+    the missed games count instead). Game logs only, so finished seasons work too."""
+    on = {w: set(next((m.get("players") or [] for m in lg.matchups[w] if m["roster_id"] == r), [])) for w in lg.weeks}
+    out = {}
+    for t in sorted(lg.transactions, key=lambda t: t["status_updated"]):
+        if t["status"] != "complete" or t["type"] == "trade":  # a traded player wasn't cut
+            continue
+        for p, rr in (t.get("drops") or {}).items():
+            if rr != r or p in out or p.isalpha() or ppg.get(p, 0) < min_ppg:
+                continue
+            held = [w for w in lg.weeks if w <= t["leg"] and p in on[w]]
+            if not held:
+                continue
+            wl = held[-1]
+            team = _nfl_team(lg, p, wl)
+            sat = p not in lg.played[wl] and team not in lg.bye.get(wl, set())
+            hurt = p in lg.played[wl] and any(team in ts and _matches(lg, p, n) for n, ts in exits.get(wl, ()))
+            if not (sat or hurt):
+                continue
+            weeks = []
+            for w in lg.weeks:
+                if w <= wl:
+                    continue
+                if p in lg.played[w] or p in on[w]:
+                    break
+                if _nfl_team(lg, p, w) not in lg.bye.get(w, set()):
+                    weeks.append(w)
+            if not weeks:
+                continue  # back before his team played again: not a costly cut
+            info = lg.players.get(p) or {}
+            status = None if lg.complete else HURT.get(info.get("injury_status"))
+            now = None if lg.complete else next((lg.team[o] for o, ps in lg.roster_now.items() if p in ps), None)
+            out[p] = {"week": t["leg"], "player": lg.name_of(p), "pos": lg.pos_of(p), "ppg": ppg[p], "games": weeks,
+                      "lost": ppg[p] * len(weeks), "status": status, "injury": info.get("injury_body_part") if status else None,
+                      "now": now, "back": any(p in lg.played[w] for w in lg.weeks if w > wl)}
+    return sorted(out.values(), key=lambda x: x["week"])
+
+
+PRIOR_GAMES = 3  # weight of the preseason projection in a player's injury-table value, in games
+
+
+def injuries(lg, min_ppg=8.0):
+    """Points lost to injury: games missed while the player's NFL team played, and games he left hurt and never returned to,
+    plus starts wasted on players who didn't play at all, and games missed after the team cut a hurt player."""
+    exits = {w: injury_exits(lg, w) for w in lg.weeks}
+    # a player's worth = his average in games he finished: the game he got hurt in drags it down and would hide him
+    ppg, hurt_in = dict(_ppg(lg)), set()
+    rostered = {p for w in lg.weeks for m in lg.matchups[w] for p in m.get("players") or [] if not p.isalpha()}
+    for w in lg.weeks:
+        for p in rostered:
+            if p in lg.played[w] and any(_nfl_team(lg, p, w) in ts and _matches(lg, p, n) for n, ts in exits[w]):
+                hurt_in.add((p, w))
+    # and a few games are a thin sample, so start from his preseason projection (Sleeper's week 1 projection, or his first
+    # projected week) and let real games take over: the projection counts as PRIOR_GAMES games at that rate
+    def preseason(p):
+        for w in lg.weeks:
+            v = lg.proj(w)[0].get(p, 0)
+            if v > 0:
+                return v
+        return None
+    for p in rostered:
+        full = [lg.pts[p].get(w, 0) for w in lg.weeks if p in lg.played[w] and (p, w) not in hurt_in]
+        pre = preseason(p)
+        if pre is None:
+            if full:
+                ppg[p] = sum(full) / len(full)
+            continue
+        ppg[p] = (sum(full) + PRIOR_GAMES * pre) / (len(full) + PRIOR_GAMES)
+    out = []
+    for r, name in lg.team.items():
+        missed, left, dead = [], [], []
+        for w in lg.weeks:
+            m = next(m for m in lg.matchups[w] if m["roster_id"] == r)
+            for p in m.get("players") or []:
+                v, team = ppg.get(p, 0), _nfl_team(lg, p, w)
+                if p not in lg.played[w]:
+                    if p in m["starters"] and p != "0":
+                        dead.append((w, lg.name_of(p), lg.pos_of(p), "bye" if team in lg.bye.get(w, set()) else "didn’t play"))
+                    if v >= min_ppg and team not in lg.bye.get(w, set()):
+                        missed.append((w, lg.name_of(p), v))
+                elif v >= min_ppg and (p, w) in hurt_in:
+                    got = lg.pts[p].get(w, 0)
+                    left.append((w, lg.name_of(p), max(0.0, v - got), got, p in m["starters"]))
+        cut = dropped_hurt(lg, r, ppg, exits, min_ppg)
+        out.append({"team": name, "missed": missed, "left": left, "dead": dead, "cut": cut,
+                    "out": sum(x[2] for x in missed), "early": sum(x[2] for x in left), "after": sum(c["lost"] for c in cut)})
+    return sorted(out, key=lambda x: -(x["out"] + x["early"] + x["after"]))
+
+
+# ---------------------------------------------------------------- opponents' career days (season)
+def opponent_peaks(lg, top=2, min_games=3, floor=15.0):
+    """For each team: opposing starters who had one of their `top` best games of the season against it (and at least
+    `floor` points, so a scrub's best day doesn't count), versus how many you'd expect by chance. A player with n games,
+    k of them qualifying, has a k-in-n chance that any one game is one of them."""
+    games = {p: sorted(((lg.pts[p].get(w, 0), w) for w in lg.weeks if p in lg.played[w]), reverse=True) for p in lg.pts}
+    out = []
+    for r, name in lg.team.items():
+        actual, expected, extra, hits = 0, 0.0, 0.0, []
+        for w in lg.weeks:
+            opp = lg.opponent(w).get(r)
+            if opp is None:
+                continue
+            m = next(m for m in lg.matchups[w] if m["roster_id"] == opp)
+            for p in m["starters"]:
+                g = games.get(p, [])
+                if p == "0" or p not in lg.played[w] or len(g) < min_games:
+                    continue
+                cut = g[min(top, len(g)) - 1][0]  # ties with the last qualifying game count
+                best = [x for x, _ in g if x >= cut and x >= floor]
+                expected += len(best) / len(g)
+                v = lg.pts[p].get(w, 0)
+                if v >= cut and v >= floor:
+                    avg = sum(x for x, _ in g) / len(g)
+                    actual += 1
+                    extra += v - avg
+                    hits.append({"week": w, "player": lg.name_of(p), "pos": lg.pos_of(p), "opp": lg.team[opp], "pts": v, "avg": avg,
+                                 "rank": 1 + sum(1 for x, _ in g if x > v)})  # 1 = season best, ties share the higher rank
+        out.append({"team": name, "actual": actual, "expected": expected, "extra": extra, "hits": sorted(hits, key=lambda h: h["week"])})
+    return sorted(out, key=lambda x: -(x["actual"] - x["expected"]))
+
+
+# ---------------------------------------------------------------- points wiped out by penalties (season)
+_ESPN_TEAM = {"HST": "HOU", "BLT": "BAL", "CLV": "CLE", "ARZ": "ARI", "LA": "LAR", "JAC": "JAX", "WSH": "WAS"}
+_PEN = re.compile(r"PENALTY on ([A-Z]{2,3})(?:-([^,]+))?, ([^,]+?), (\d+) yards?")  # some flags name only the team
+
+
+def flagged_plays(lg):
+    """Runs and catches wiped out by a penalty, with the fantasy points each player lost. Two kinds:
+    - accepted "No Play" flags: the whole play comes off the board;
+    - touchdowns "NULLIFIED" by a spot foul: the run or catch counts up to the flag, so the touchdown and the yards
+      after the flag are what's lost.
+    Each item: week, player id, points lost, yards, touchdown?, kind, penalty, who was flagged, own team's flag?"""
+    sc = lg.scoring
+    by_espn = {str(v["espn_id"]): k for k, v in lg.players.items() if v.get("espn_id")}
+    by_name = collections.defaultdict(list)
+    for k, v in lg.players.items():
+        if v.get("full_name"):
+            by_name[winprob._norm(v["full_name"])].append(k)
+    box = {}  # game id -> {espn id: (team, normalized name)}, for players Sleeper has no ESPN id for (often rookies)
+
+    def resolve(espn, g, w, token=None):
+        if espn in by_espn:
+            return by_espn[espn]
+        if g["id"] not in box:
+            try:
+                box[g["id"]] = {v: k for k, v in winprob.espn_roster_ids(g).items()}
+            except Exception as e:
+                print(f"box score for {g['name']} failed: {e}")
+                box[g["id"]] = {}
+        team, name = box[g["id"]].get(espn, (None, None))
+        for pid in by_name.get(name, []):
+            if (lg.proj(w)[1].get(pid) or (lg.players.get(pid) or {}).get("team")) == team:
+                by_espn[espn] = pid
+                return pid
+        if token:  # not in the box score (a called-back catch can be a player's only touch): match "R.Rice" on either team
+            teams = set(g["teams"])
+            hits = [pid for pid, v in lg.players.items() if v.get("position") in ("QB", "RB", "WR", "TE")
+                    and (lg.proj(w)[1].get(pid) or v.get("team")) in teams and _matches(lg, pid, token)]
+            if len(hits) == 1:
+                by_espn[espn] = hits[0]
+                return hits[0]
+        return None
+
+    out = []
+    for w in lg.weeks:
+        for g, items in game_plays(lg, w):
+            for pl in items:
+                text = pl.get("text") or ""
+                if "PENALTY" not in text:
+                    continue
+                pre, _, pen_text = text.partition("PENALTY")
+                no_play = "No Play" in text
+                if ("kicks" in pre or "punts" in pre) and "returner" in str(pl.get("participants")):
+                    r = _flagged_return(lg, g, w, pl, pre, pen_text, no_play, resolve)
+                    if r:
+                        out.append(r)
+                    continue
+                spot_td = not no_play and "NULLIFIED" in pre and "TOUCHDOWN" in pre
+                if not (no_play or spot_td):
+                    continue
+                if any(k in pre for k in ("punts", "kicks", "sacked", "incomplete", "INTERCEPTED", "Two-Point", "spiked", "kneels")):
+                    continue
+                m = re.search(r"for (-?\d+) yards?", pre)
+                yards = int(m.group(1)) if m else (0 if "no gain" in pre else None)
+                if yards is None:
+                    continue
+                td = "TOUCHDOWN" in pre
+                pen = _PEN.search("PENALTY" + pen_text)
+                spot = re.search(r"enforced at (?:([A-Z]{2,3}) )?(\d+)", pen_text)
+                parts = {}
+                for x in pl.get("participants") or []:
+                    ref = ((x.get("athlete") or {}).get("$ref") or "")
+                    if "/athletes/" in ref:
+                        parts.setdefault(x.get("type"), ref.split("/athletes/")[1].split("?")[0])
+                name = r"([A-Z][a-z]?\.[A-Z][\w'-]+(?: [A-Z][\w'-]+)?)"
+                lead = re.match(r"(?:\([^)]*\) )*" + name, pre)
+                catcher = re.search(r" pass [^.]*?to " + name, pre)
+                if "rusher" in parts:
+                    who = [(parts["rusher"], "run", lead and lead.group(1))]
+                elif "passer" in parts and "receiver" in parts:
+                    who = [(parts["passer"], "pass", lead and lead.group(1)), (parts["receiver"], "catch", catcher and catcher.group(1))]
+                else:
+                    continue
+                for espn, kind, token in who:
+                    pid = resolve(espn, g, w, token)
+                    if not pid:
+                        continue
+                    team = lg.proj(w)[1].get(pid) or (lg.players.get(pid) or {}).get("team")
+                    lost = yards
+                    if spot_td:  # yards up to the flag still count; the rest of the run and the score don't
+                        if not spot:
+                            continue
+                        side = _ESPN_TEAM.get(spot.group(1), spot.group(1)) if spot.group(1) else None
+                        to_goal = int(spot.group(2)) if side != team else 100 - int(spot.group(2))
+                        lost = max(0, min(yards, to_goal))
+                    rate, td_pts = {"run": (sc.get("rush_yd", 0), sc.get("rush_td", 0)), "pass": (sc.get("pass_yd", 0), sc.get("pass_td", 0)),
+                                    "catch": (sc.get("rec_yd", 0), sc.get("rec_td", 0))}[kind]
+                    pts = lost * rate + td * td_pts + (sc.get("rec", 0) if kind == "catch" and no_play else 0)
+                    if pts <= 0:
+                        continue
+                    flag_team = _ESPN_TEAM.get(pen.group(1), pen.group(1)) if pen else None
+                    out.append({"week": w, "pid": pid, "player": lg.name_of(pid), "pos": lg.pos_of(pid), "pts": round(pts, 2),
+                                "yards": yards, "lost_yards": lost, "td": td, "kind": kind, "spot": spot_td,
+                                "penalty": pen.group(3).strip() if pen else "penalty",
+                                "flagged": ((pen.group(2) or "the team").strip() + f" ({flag_team})") if pen else "",
+                                "own": bool(pen) and flag_team == team, "game": g["name"]})
+    return out
+
+
+def _flagged_return(lg, g, w, pl, pre, pen_text, no_play, resolve):
+    """A kick or punt return cut short by a flag. A "No Play" (re-kick) wipes the whole return; a foul by the return
+    team during it counts the return only up to the flag, so the yards after it (and any touchdown) are lost."""
+    ret = re.search(r"\. ([A-Z][a-z]?\.[A-Z][\w'-]+(?: [A-Z][\w'-]+)?) [^.]*?(?:(?:to|at) ([A-Z]{2,3}) (\d+)|for) [^.]*?(?:for )?(-?\d+) yards?", pre)
+    pen = _PEN.search("PENALTY" + pen_text)
+    spot = re.search(r"enforced at (?:([A-Z]{2,3}) )?(\d+)", pen_text)
+    ref = next(((x.get("athlete") or {}).get("$ref") or "" for x in pl.get("participants") or [] if x.get("type") == "returner"), "")
+    if not ret or not pen or "/athletes/" not in ref:
+        return None
+    pid = resolve(ref.split("/athletes/")[1].split("?")[0], g, w, ret.group(1))
+    if not pid:
+        return None
+    team = lg.proj(w)[1].get(pid) or (lg.players.get(pid) or {}).get("team")
+    flag_team = _ESPN_TEAM.get(pen.group(1), pen.group(1))
+    yards, td = int(ret.group(4)), "TOUCHDOWN" in pre.split(ret.group(1), 1)[1]
+    pos = lambda abbr, n: 50 if not abbr else (int(n) if _ESPN_TEAM.get(abbr, abbr) == team else 100 - int(n))
+    if no_play:
+        lost = yards
+    elif flag_team == team and spot:  # the return team's own foul: everything past the flag comes back
+        end = 100 if td else (pos(ret.group(2), ret.group(3)) if ret.group(2) else None)
+        if end is None:
+            return None
+        lost = max(0, end - pos(spot.group(1), spot.group(2)))
+    else:
+        return None
+    kind = "kick return" if "kicks" in pre else "punt return"
+    sc = lg.scoring
+    pts = lost * sc.get("kr_yd" if kind == "kick return" else "pr_yd", 0) + (td * sc.get("st_td", 0))
+    if pts <= 0:
+        return None
+    return {"week": w, "pid": pid, "player": lg.name_of(pid), "pos": lg.pos_of(pid), "pts": round(pts, 2), "yards": yards,
+            "lost_yards": lost, "td": td, "kind": kind, "spot": not no_play, "penalty": pen.group(3).strip(),
+            "flagged": (pen.group(2) or "the team").strip() + f" ({flag_team})", "own": flag_team == team, "game": g["name"]}
+
+
+def flagged_away(lg):
+    """Per fantasy team: points its starters lost to wiped-out plays, split by whose flag it was."""
+    plays = flagged_plays(lg)
+    starters = {(m["roster_id"], w): set(m["starters"]) for w in lg.weeks for m in lg.matchups[w]}
+    teams = []
+    for r, name in lg.team.items():
+        mine = [dict(p) for p in plays if p["pid"] in starters.get((r, p["week"]), ())]
+        teams.append({"team": name, "plays": sorted(mine, key=lambda p: (p["week"], -p["pts"])),
+                      "own": sum(p["pts"] for p in mine if p["own"]), "theirs": sum(p["pts"] for p in mine if not p["own"]),
+                      "total": sum(p["pts"] for p in mine)})
+    teams.sort(key=lambda t: -t["total"])
+    on = {}  # (player, week) -> (fantasy team, in the starting lineup?)
+    for w in lg.weeks:
+        for m in lg.matchups[w]:
+            for p in m.get("players") or []:
+                on[(p, w)] = (lg.team[m["roster_id"]], p in m["starters"])
+    tagged = [dict(p, fantasy=on.get((p["pid"], p["week"]), (None, False))[0], started=on.get((p["pid"], p["week"]), (None, False))[1])
+              for p in plays]
+    biggest = sorted((p for p in tagged if p["started"]), key=lambda p: -p["pts"])[:10]
+    per = collections.defaultdict(list)
+    for p in tagged:
+        if p["fantasy"]:  # only plays while the player was on someone's roster
+            per[p["pid"]].append(p)
+    players = []
+    for pid, ps in per.items():
+        owners = list(dict.fromkeys(p["fantasy"] for p in sorted(ps, key=lambda p: p["week"])))
+        players.append({"player": ps[0]["player"], "pos": ps[0]["pos"], "teams": owners, "plays": sorted(ps, key=lambda p: (p["week"], -p["pts"])),
+                        "pts": sum(p["pts"] for p in ps), "n": len(ps), "started_pts": sum(p["pts"] for p in ps if p["started"])})
+    players = sorted(players, key=lambda x: -x["pts"])[:10]
+    return {"teams": teams, "biggest": biggest, "players": players, "n": len(plays)}
+
+
+# ---------------------------------------------------------------- kicking (season)
+_K_BANDS = [("0–39", ("0_19", "20_29", "30_39")), ("40–49", ("40_49",)), ("50–59", ("50_59",)), ("60+", ("60p",))]
+# typical NFL make rates by distance, for the value of a kick that was never tried
+_MAKE = [(30, .985), (40, .93), (50, .84), (55, .74), (60, .62), (99, .45)]
+
+
+def _espn_kickers(lg):
+    """{(NFL team, normalized name): (espn id, career long FG)} plus {NFL team: head coach}, from ESPN team rosters."""
+    if "_kickers" in lg.__dict__:
+        return lg._kickers
+    out, coaches = {}, {}
+    for tid in list(range(1, 31)) + [33, 34]:
+        try:
+            d = winprob._fetch(f"https://site.api.espn.com/apis/site/v2/sports/football/nfl/teams/{tid}/roster")
+        except Exception as e:
+            print(f"roster {tid} failed: {e}")
+            continue
+        abbr = winprob.ESPN_TO_SLEEPER_TEAM.get(d["team"]["abbreviation"], d["team"]["abbreviation"])
+        c = (d.get("coach") or [{}])[0]
+        coaches[abbr] = f'{c.get("firstName", "")} {c.get("lastName", "")}'.strip()
+        for grp in d.get("athletes", []):
+            for a in grp.get("items", []):
+                if (a.get("position") or {}).get("abbreviation") == "PK":
+                    out[(abbr, winprob._norm(a["displayName"]))] = (a["id"], None)
+    for key, (aid, _) in list(out.items()):
+        try:
+            st = winprob._fetch(f"https://site.web.api.espn.com/apis/common/v3/sports/football/nfl/athletes/{aid}/stats")
+            for cat in st.get("categories", []):
+                if "longFieldGoalMade" in (cat.get("names") or []):
+                    i = cat["names"].index("longFieldGoalMade")
+                    out[key] = (aid, int(float((cat.get("totals") or [0] * (i + 1))[i] or 0)))
+        except Exception as e:
+            print(f"career long for {key} failed: {e}")
+    lg._kickers = (out, coaches)
+    return lg._kickers
+
+
+def _career_long(lg, pid):
+    info = lg.players.get(pid) or {}
+    ks, _ = _espn_kickers(lg)
+    name = winprob._norm(info.get("full_name") or "")
+    for (team, n), (_, lng) in ks.items():
+        if n == name and lng:
+            return lng
+    return None
+
+
+def kicker_profile(lg):
+    """Every kicker who spent time on a fantasy roster: makes/attempts by distance, long-kick share, season and career long."""
+    stats = {}
+    for w in lg.weeks:
+        for r in winprob._fetch(f"https://api.sleeper.app/stats/nfl/{lg.season}/{w}?season_type=regular&position[]=K"):
+            if r["player_id"] in stats or (r.get("stats") or {}).get("fga") or (r.get("stats") or {}).get("xpa"):
+                stats.setdefault(r["player_id"], []).append(r.get("stats") or {})
+    owners = collections.defaultdict(list)
+    for w in lg.weeks:
+        for m in lg.matchups[w]:
+            for p in m.get("players") or []:
+                if lg.pos_of(p) == "K" and lg.team[m["roster_id"]] not in owners[p]:
+                    owners[p].append(lg.team[m["roster_id"]])
+    out = []
+    for pid, owned in owners.items():
+        rows = stats.get(pid, [])
+        if not rows:
+            continue
+        tot = lambda k: sum(r.get(k, 0) or 0 for r in rows)
+        bands = []
+        for label, keys in _K_BANDS:
+            made = sum(tot(f"fgm_{k}") for k in keys) if label != "60+" else tot("fgm_50p") - tot("fgm_50_59")
+            miss = sum(tot(f"fgmiss_{k}") for k in keys)
+            bands.append((label, made, made + miss))
+        games = sum(1 for w in lg.weeks if pid in lg.played[w])
+        att = sum(b[2] for b in bands)
+        sc = lg.scoring
+        miss_keys = ("0_19", "20_29", "30_39", "40_49", "50_59", "60p")
+        # points the misses cost under this league's scoring (FG misses by distance, plus missed extra points)
+        lost = sum(tot(f"fgmiss_{k}") * sc.get(f"fgmiss_{k}", 0) for k in miss_keys) + tot("fgmiss") * sc.get("fgmiss", 0) \
+            + tot("xpmiss") * sc.get("xpmiss", 0)
+        out.append({"player": lg.name_of(pid), "nfl": (lg.players.get(pid) or {}).get("team"), "owners": owned, "bands": bands,
+                    "xp": (tot("xpm"), tot("xpa")), "att": att, "made": sum(b[1] for b in bands), "missed": att - sum(b[1] for b in bands),
+                    "lost": lost, "long_share": (bands[2][2] + bands[3][2]) / att if att else 0,
+                    "season_long": max((r.get("fgm_lng", 0) or 0 for r in rows), default=0), "career_long": _career_long(lg, pid),
+                    "ppg": sum(lg.pts[pid].get(w, 0) for w in lg.weeks if pid in lg.played[w]) / games if games else 0, "games": games})
+    return sorted(out, key=lambda x: -x["ppg"])
+
+
+def _kick_value(lg, d):
+    """What a field goal try from d yards was worth under this league's scoring, before it was kicked."""
+    sc = lg.scoring
+    p = next(rate for lim, rate in _MAKE if d < lim)
+    band = "60p" if d >= 60 else "50_59" if d >= 50 else "40_49" if d >= 40 else "30_39" if d >= 30 else "20_29" if d >= 20 else "0_19"
+    made = sc.get(f"fgm_{band}", 0) + (sc.get("fgm_50p", 0) if d >= 50 else 0) + d * sc.get("fgm_yds", 0) + sc.get("fgm", 0)
+    miss = sc.get(f"fgmiss_{band}", 0) + (sc.get("fgmiss_50p", 0) if d >= 50 else 0) + sc.get("fgmiss", 0)
+    return p * made + (1 - p) * miss
+
+
+_GO = {"Rush", "Pass Reception", "Pass Incompletion", "Sack", "Pass Interception Return", "Fumble Recovery (Own)",
+       "Fumble Recovery (Opponent)", "Interception Return Touchdown", "Fumble Return Touchdown"}
+
+
+def coach_decisions(lg):
+    """4th downs inside the kicker's career-long range where the coach punted or went for it and didn't convert."""
+    _, coaches = _espn_kickers(lg)
+    kicker = {}  # (team, week) -> the kicker who played
+    for w in lg.weeks:
+        for pid in lg.played[w]:
+            if lg.pos_of(pid) == "K":
+                kicker[(lg.proj(w)[1].get(pid) or (lg.players.get(pid) or {}).get("team"), w)] = pid
+    started = {}
+    for w in lg.weeks:
+        for m in lg.matchups[w]:
+            for p in m["starters"]:
+                started[(p, w)] = lg.team[m["roster_id"]]
+    longs = {}
+    out = []
+    for w in lg.weeks:
+        for g, items in game_plays(lg, w):
+            score = {t: 0 for t in g["teams"]}
+            for i, pl in enumerate(items):
+                st = pl.get("start") or {}
+                team = g.get("ids", {}).get(((st.get("team") or {}).get("$ref") or "").split("/teams/")[-1].split("?")[0])
+                kind = (pl.get("type") or {}).get("text") or ""
+                before = dict(score)
+                if pl.get("homeScore") is not None and g.get("home"):
+                    away = next(t for t in g["teams"] if t != g["home"])
+                    score = {g["home"]: pl["homeScore"], away: pl["awayScore"]}
+                if st.get("down") != 4 or not team or "No Play" in (pl.get("text") or ""):
+                    continue
+                if kind.startswith("Punt"):
+                    call = "punted"
+                elif kind in _GO:
+                    nxt = next((q for q in items[i + 1:] if (q.get("start") or {}).get("down")), None)
+                    same = nxt and ((nxt.get("start") or {}).get("team") or {}).get("$ref") == (st.get("team") or {}).get("$ref")
+                    if same or "TOUCHDOWN" in (pl.get("text") or ""):
+                        continue  # converted: the drive went on
+                    call = "went for it and failed"
+                else:
+                    continue
+                # ESPN's yardsToEndzone is often measured from the wrong goal line; work it out from "SEA 49" and who has the ball
+                spot = re.match(r"(?:([A-Z]{2,3}) )?(\d+)", st.get("possessionText") or "")
+                if not spot:
+                    continue
+                side = winprob.ESPN_TO_SLEEPER_TEAM.get(spot.group(1), spot.group(1)) if spot.group(1) else None
+                side = {"LA": "LAR", "WSH": "WAS"}.get(side, side)
+                to_goal = 50 if not side else (100 - int(spot.group(2)) if side == team else int(spot.group(2)))
+                d = to_goal + 18  # this season's field goals: listed distance = yards to the goal line + 18 in nearly all of them
+                k = kicker.get((team, w))
+                if not k:
+                    continue
+                if k not in longs:
+                    longs[k] = _career_long(lg, k)
+                lng = longs[k] or 55
+                opp = next((t for t in g["teams"] if t != team), None)
+                q, clock = (pl.get("period") or {}).get("number", 0), (pl.get("clock") or {}).get("displayValue", "15:00")
+                mins = int(clock.split(":")[0]) if ":" in clock else 15
+                if d > lng or (q >= 4 and mins < 2 and before.get(opp, 0) - before.get(team, 0) >= 4):
+                    continue
+                out.append({"week": w, "team": team, "coach": coaches.get(team, ""), "kicker": lg.name_of(k), "pid": k,
+                            "distance": d, "career_long": lng, "call": call, "value": _kick_value(lg, d),
+                            "started_by": started.get((k, w)), "q": q, "clock": clock, "game": g["name"],
+                            "dd": (st.get("shortDownDistanceText") or "").replace(" & ", " and ")})
+    return out
+
+
+def coach_summary(lg):
+    plays = coach_decisions(lg)
+    teams = []
+    for r, name in lg.team.items():
+        mine = sorted((p for p in plays if p["started_by"] == name), key=lambda p: (p["week"], -p["value"]))
+        teams.append({"team": name, "plays": mine, "total": sum(p["value"] for p in mine)})
+    teams.sort(key=lambda t: -t["total"])
+    nfl = collections.defaultdict(lambda: {"n": 0, "value": 0.0, "punts": 0, "coach": ""})
+    for p in plays:
+        c = nfl[p["team"]]
+        c["n"] += 1
+        c["value"] += p["value"]
+        c["punts"] += p["call"] == "punted"
+        c["coach"] = p["coach"]
+    coaches = sorted(({"team": t, **v} for t, v in nfl.items()), key=lambda x: -x["value"])[:10]
+    return {"teams": teams, "coaches": coaches, "n": len(plays)}
+
+
+# ---------------------------------------------------------------- roster age, experience and injury history (season)
+def availability_history(lg, min_ppg=6.0, positions=("QB", "RB", "WR", "TE", "K")):
+    """{player: {"played", "possible", "seasons"}} across every dynasty season (config.FIRST_SEASON on): games played versus games his
+    NFL team played while he was on it. A season only counts if he was a real contributor (min_ppg when he played), so
+    backups who dress and never play aren't counted as hurt."""
+    if "_avail" in lg.__dict__:
+        return lg._avail
+    seasons = [info["season"] for _, info in config.league_chain(lg.client, lg.id)]
+    out = collections.defaultdict(lambda: {"played": 0, "possible": 0, "seasons": 0})
+    for season in seasons:
+        last = lg.weeks[-1] if season == lg.season else 18
+        sched = winprob._fetch(f"https://api.sleeper.app/schedule/nfl/regular/{season}")
+        plays_in = collections.defaultdict(set)  # week -> NFL teams with a game
+        for g in sched:
+            plays_in[g["week"]] |= {g["home"], g["away"]}
+        team_wk, gp, pts = collections.defaultdict(dict), collections.defaultdict(set), collections.defaultdict(list)
+        pos_q = "".join(f"&position[]={p}" for p in positions)
+        for w in range(1, last + 1):
+            for kind in ("stats", "projections"):
+                try:
+                    rows = winprob._fetch(f"https://api.sleeper.app/{kind}/nfl/{season}/{w}?season_type=regular{pos_q}")
+                except Exception as e:
+                    print(f"{kind} {season} wk {w} failed: {e}")
+                    continue
+                for r in rows:
+                    pid = r["player_id"]
+                    if r.get("team"):
+                        team_wk[pid].setdefault(w, r["team"])
+                    st = r.get("stats") or {}
+                    if kind == "stats" and st.get("gp"):
+                        gp[pid].add(w)
+                        pts[pid].append(winprob.score_stats(st, lg.scoring))
+        for pid, wk in team_wk.items():
+            if not gp[pid] or sum(pts[pid]) / len(pts[pid]) < min_ppg:
+                continue
+            first, lastw = min(wk), max(wk)
+            known = sorted(wk.items())
+            possible = 0
+            for w in range(first, lastw + 1):
+                team = wk.get(w) or min(known, key=lambda kv: abs(kv[0] - w))[1]  # weeks with no row: nearest known team
+                possible += team in plays_in[w]
+            o = out[pid]
+            o["played"] += len(gp[pid])
+            o["possible"] += max(possible, len(gp[pid]))
+            o["seasons"] += 1
+    lg._avail = dict(out)
+    return lg._avail
+
+
+def roster_profile(lg, vet=8):
+    """Per fantasy team: age, NFL experience and injury history of its current roster and its regular starters."""
+    avail = availability_history(lg)
+    starts = collections.Counter()
+    for w in lg.weeks:
+        for m in lg.matchups[w]:
+            for p in m["starters"]:
+                starts[(m["roster_id"], p)] += 1
+    n_start = sum(1 for sl in lg.slots if sl != "DEF")  # team defenses aren't in this table
+    out = []
+    for r, name in lg.team.items():
+        players = []
+        for pid in lg.roster_now.get(r, ()):
+            info = lg.players.get(pid) or {}
+            if lg.pos_of(pid) == "DEF" or info.get("age") is None:  # a team defense has no age or experience
+                continue
+            a = avail.get(pid)
+            players.append({"pid": pid, "player": lg.name_of(pid), "pos": lg.pos_of(pid), "age": info.get("age"),
+                            "exp": info.get("years_exp") or 0, "starts": starts[(r, pid)],
+                            "played": a["played"] if a else None, "possible": a["possible"] if a else None,
+                            "missed": (a["possible"] - a["played"]) if a else None,
+                            "status": info.get("injury_status"), "body": info.get("injury_body_part")})
+        players.sort(key=lambda p: (-p["starts"], -(p["played"] or 0)))
+        core = players[:n_start]  # the players who have started the most for this team
+        tracked = [p for p in core if p["possible"]]
+        mean = lambda xs: sum(xs) / len(xs) if xs else 0
+        out.append({"team": name, "players": players,
+                    "age": mean([p["age"] for p in players]), "core_age": mean([p["age"] for p in core]),
+                    "exp": mean([p["exp"] for p in players]),
+                    "rookies": sum(1 for p in players if p["exp"] == 0), "vets": sum(1 for p in players if p["exp"] >= vet),
+                    "oldest": max(players, key=lambda p: p["age"], default=None), "youngest": min(players, key=lambda p: p["age"], default=None),
+                    # games missed per 17 by the core, since 2025
+                    "miss17": 17 * sum(p["missed"] for p in tracked) / sum(p["possible"] for p in tracked) if tracked else 0,
+                    "hurt": sum(1 for p in players if p["status"] in ("Out", "IR", "Doubtful", "PUP"))})
+    return sorted(out, key=lambda t: -t["core_age"])
