@@ -652,47 +652,97 @@ def week_totals(lg, r):
     return out
 
 
+def acquisition_log(lg):
+    """{(owner, player): [(key, kind, season)]}: every way a manager got a player across the dynasty seasons up to this one,
+    so a player kept from an earlier season is still credited to how he first arrived. kind is "startup" (the first
+    dynasty draft), "expansion" (a later annual draft), "waiver" (waiver claim or free agent) or "trade". key orders the
+    events: (season, week it took effect, time)."""
+    if "_acq" in lg.__dict__:
+        return lg._acq
+    log = collections.defaultdict(list)
+    for lid, info in config.league_chain(lg.client, lg.id):
+        season = int(info["season"])
+        current = lid == lg.id
+        if current:
+            owner, picks, txs, dtime = lg.owner, lg.picks, lg.transactions, lg.draft_time
+        else:
+            owner = {r["roster_id"]: r.get("owner_id") for r in lg.client.rosters(lid)}
+            drafts = lg.client.league_drafts(lid)
+            picks = lg.client.draft_picks(drafts[0]["draft_id"]) if drafts else []
+            dtime = (drafts[0].get("last_picked") or drafts[0].get("start_time") or 0) / 1000 if drafts else 0
+            last = (info["settings"].get("last_scored_leg") or 18) + 1
+            txs = [dict(t, leg=w) for w in range(1, last + 1) for t in lg.client.transactions(lid, w)]
+        kind = "startup" if season == config.FIRST_SEASON else "expansion"
+        for pk in picks:
+            log[(owner.get(pk["roster_id"]), pk["player_id"])].append(((season, 1, dtime * 1000), kind, season))
+        for t in txs:
+            if t["status"] != "complete" or t["type"] not in ("waiver", "free_agent", "trade", "commissioner"):
+                continue
+            k = "trade" if t["type"] == "trade" else "waiver"
+            if current:
+                eff = t["leg"] if t["type"] == "waiver" else lg.first_week_after(t["status_updated"] / 1000)
+            else:
+                eff = t["leg"]
+            for pid, r in (t.get("adds") or {}).items():
+                log[(owner.get(r), pid)].append(((season, eff, t["status_updated"]), k, season))
+    for v in log.values():
+        v.sort()
+    lg._acq = log
+    return log
+
+
+def source_kinds(seasons):
+    """[(key, label, color)] for the acquisition split: startup draft, each expansion draft, pickups, trades."""
+    first = config.FIRST_SEASON
+    exp = [y for y in sorted(set(int(s) for s in seasons)) if y > first]
+    cols = ["var(--c4)", "var(--c5)", "var(--c6)", "var(--c1)"]
+    return ([("startup", f"{first} startup draft", "var(--c1)")]
+            + [(f"exp{y}", f"{y} expansion draft", cols[i % 3]) for i, y in enumerate(exp)]
+            + [("waiver", "Waiver / free agent", "var(--c2)"), ("trade", "Trade", "var(--c3)")])
+
+
 def sources(lg):
-    """Starting-lineup points per team split by how the player got there: draft (and which round), waiver/free agent, or trade."""
-    events = collections.defaultdict(list)  # (roster, player) -> [(effective week, time, kind, round)]
-    keepers = {(p["roster_id"], p["player_id"]) for p in lg.picks if p.get("is_keeper")}
-    for p in lg.picks:
-        events[(p["roster_id"], p["player_id"])].append((0, 0, "draft", p["round"]))
-    for t in lg.transactions:
-        if t["status"] != "complete" or t["type"] not in ("waiver", "free_agent", "trade"):
-            continue
-        kind = "trade" if t["type"] == "trade" else "waiver"
-        eff = t["leg"] if t["type"] == "waiver" else lg.first_week_after(t["status_updated"] / 1000)
-        for pid, r in (t.get("adds") or {}).items():
-            events[(r, pid)].append((eff, t["status_updated"], kind, None))
+    """Starting-lineup points per team split by how the manager got the player: the startup draft, an expansion draft
+    (by year), a waiver/free-agent pickup or a trade, looking back through every dynasty season."""
+    log = acquisition_log(lg)
+    season = int(lg.season)
     out = {}
     for r, name in lg.team.items():
-        row = {"team": name, "draft": 0.0, "waiver": 0.0, "trade": 0.0, "rounds": collections.Counter(),
-               "round_players": collections.defaultdict(collections.Counter), "keeper": 0.0,
-               "keeper_round": next((p["round"] for p in lg.picks if p.get("is_keeper") and p["roster_id"] == r), None),
-               "players": collections.defaultdict(lambda: [0.0, None, None])}
+        o = lg.owner[r]
+        row = {"team": name, "by": collections.Counter(), "rounds": collections.Counter(),
+               "round_players": collections.defaultdict(collections.Counter), "this_draft": 0.0,
+               "players": collections.defaultdict(lambda: [0.0, 0, None, None])}  # pid -> [pts, starts, key, how]
         for w in lg.weeks:
             m = next(m for m in lg.matchups[w] if m["roster_id"] == r)
             for pid, v in zip(m["starters"], m["starters_points"]):
                 if pid == "0":
                     continue
-                ev = [e for e in events.get((r, pid), []) if e[0] <= w] or events.get((r, pid), [])
-                kind, rnd = (max(ev)[2], max(ev)[3]) if ev else ("waiver", None)
-                row[kind] += v
-                if kind == "draft":
-                    row["rounds"][rnd] += v
-                    row["round_players"][rnd][lg.name_of(pid)] += v
-                    if (r, pid) in keepers:
-                        row["keeper"] += v
+                evs = log.get((o, pid), [])
+                ev = [e for e in evs if e[0][:2] <= (season, w)] or evs
+                if ev:
+                    _, kind, yr = ev[-1]
+                else:
+                    kind, yr = "waiver", season  # no record of how he arrived (shouldn't happen); call it a pickup
+                key = "startup" if kind == "startup" else f"exp{yr}" if kind == "expansion" else kind
+                how = (f"{yr} pickup" if kind == "waiver" else f"{yr} trade" if kind == "trade" else "")
+                row["by"][key] += v
+                if kind in ("startup", "expansion") and yr == season:  # this season's draft, by round
+                    rnd = next((p["round"] for p in lg.picks if p["player_id"] == pid and p["roster_id"] == r), None)
+                    if rnd:
+                        row["rounds"][rnd] += v
+                        row["round_players"][rnd][lg.name_of(pid)] += v
+                        row["this_draft"] += v
                 pl = row["players"][pid]
                 pl[0] += v
-                pl[1], pl[2] = kind, rnd
-        row["total"] = row["draft"] + row["waiver"] + row["trade"]
-        best = {}
-        for pid, (v, kind, _) in row["players"].items():
-            if kind and (kind not in best or v > best[kind][1]):
-                best[kind] = (lg.name_of(pid), v)
-        row["best"] = best
+                pl[1] += 1
+                pl[2], pl[3] = key, how
+        row["total"] = sum(row["by"].values())
+        row["detail"] = {}
+        for pid, (v, n, key, how) in row["players"].items():
+            row["detail"].setdefault(key, []).append((lg.name_of(pid), lg.pos_of(pid), round(v, 1), n, how))
+        for k in row["detail"]:
+            row["detail"][k].sort(key=lambda x: -x[2])
+        row["best"] = {k: (xs[0][0], xs[0][2]) for k, xs in row["detail"].items()}
         del row["players"]
         row["round_notes"] = {p["round"]: _pick_note(lg, r, p["player_id"]) for p in lg.picks
                               if p["roster_id"] == r and row["rounds"].get(p["round"], 0) <= 0}
@@ -1152,6 +1202,19 @@ def _replacement(lg):
             for pos, v in ppg.items() if pos in need}
 
 
+def pre_draft_rostered(lg):
+    """Players on a roster when this season's draft started: today's rosters with every add and drop since the draft
+    undone, minus the players drafted. Everyone else was in the draft pool. (Checked against the previous season's
+    final rosters rolled forward through the offseason moves: same 310 players for 2026.)"""
+    held = set().union(*lg.roster_now.values()) if lg.roster_now else set()
+    for t in sorted((t for t in lg.transactions if t["status"] == "complete"), key=lambda t: -t["status_updated"]):
+        if t["status_updated"] / 1000 <= lg.draft_time:
+            break
+        held -= set(t.get("adds") or {})
+        held |= set(t.get("drops") or {})
+    return held - {p["player_id"] for p in lg.picks}
+
+
 def draft_extras(lg):
     """Grades, board, redraft and position payoff for this season's draft."""
     rows = draft(lg)
@@ -1183,16 +1246,23 @@ def draft_extras(lg):
     # redraft: everyone who played, ranked by points per game above a replacement starter at the position, times games
     repl = _replacement(lg)
     taken = {x["pid"]: x for x in rows}
+    # the startup draft took from everyone; an expansion draft only from players who weren't already on a team
+    expansion = int(lg.season) != config.FIRST_SEASON
+    held = pre_draft_rostered(lg) if expansion else set()
     pool = []
     for p, wk in lg.pts.items():
         pos = lg.pos_of(p)
+        if p in held or pos not in ("QB", "RB", "WR", "TE"):  # kickers and defenses are left out
+            continue
         ws = [w for w in lg.weeks if p in lg.played[w]]
         if pos not in repl or not ws:
             continue
         total = sum(wk[w] for w in ws)
         pool.append({"player": lg.name_of(p), "pos": pos, "pts": total, "games": len(ws),
                      "var": total - repl[pos] * len(ws), "orig": taken.get(p)})
-    pool.sort(key=lambda z: -z["var"])
+    # an expansion pool is mostly rookies and backups, so points over a starter would bury anyone who isn't one yet: rank by
+    # points scored instead; the startup draft (everyone) keeps points above replacement so quarterbacks don't take over
+    pool.sort(key=lambda z: -(z["pts"] if expansion else z["var"]))
     redraft = pool[:2 * len(lg.team)]
     # position payoff by round band
     bands = [(1, 2), (3, 5), (6, 9), (10, 99)]
@@ -1202,5 +1272,5 @@ def draft_extras(lg):
             xs = [x for x in rows if x["pos"] == pos and lo <= x["round"] <= hi]
             if xs:
                 payoff[(pos, lo)] = {"n": len(xs), "avg": st.mean(x["value"] for x in xs), "hit": sum(1 for x in xs if x["value"] > 0) / len(xs)}
-    return {"rows": rows, "grades": grades, "redraft": redraft, "payoff": payoff, "bands": bands,
+    return {"rows": rows, "grades": grades, "redraft": redraft, "payoff": payoff, "bands": bands, "expansion": expansion,
             "slots": sorted({x["slot"] for x in rows if x["slot"]}), "rounds": max(x["round"] for x in rows)}

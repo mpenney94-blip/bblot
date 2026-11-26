@@ -14,7 +14,7 @@ DISCOUNT = 0.85  # each later season counts this much less than the one before
 GROWTH = 0.15  # yearly gain for players in their first two NFL seasons, for the next two seasons
 # Replacement level: the player at this rank at his position (about what a 12-team league starts, flex included).
 REPL_RANK = {"QB": 14, "RB": 30, "WR": 42, "TE": 14, "K": 13, "DEF": 13}
-# A rookie pick is worth what the player at this league-wide dynasty value rank is worth, by round.
+# An expansion draft pick is worth what the player at this league-wide dynasty value rank is worth, by round.
 PICK_RANK = {1: 30, 2: 70, 3: 110, 4: 150, 5: 190}
 
 
@@ -48,7 +48,7 @@ def value_table(lg):
         v["edge"] = edge
         v["by_year"] = [edge * _age_factor(v, t) for t in range(YEARS)]
         v["value"] = sum(x * DISCOUNT ** t for t, x in enumerate(v["by_year"]))
-    # rookies drafted this year who haven't shown much yet keep at least the value of the pick they cost
+    # first-year players taken in this year's expansion draft who haven't shown much yet keep at least the value of the pick they cost
     ranked = sorted((v["value"] for v in out.values()), reverse=True)
     pv = pick_values(ranked)
     if int(lg.season) > 2025:
@@ -75,7 +75,7 @@ def pick_values(ranked):
 
 
 def pick_ownership(lg):
-    """{(season, round, original roster): owning roster} for the next three rookie drafts, from Sleeper's traded picks."""
+    """{(season, round, original roster): owning roster} for the next three expansion drafts, from Sleeper's traded picks."""
     rounds = lg.info["settings"].get("draft_rounds") or 5
     first = int(lg.season) + 1
     own = {(str(s), rd, r): r for s in range(first, first + 3) for rd in range(1, rounds + 1) for r in lg.team}
@@ -341,7 +341,7 @@ def sections(lg):
                 f'weight. Over repl. = points per game above the player at the edge of starting in a 12-team league at his position '
                 f'(QB 14th, RB 30th, WR 42nd, TE 14th). Value adds that edge over this season and the next four, each later season counting '
                 f'{int(100 * DISCOUNT)}% of the one before, with players losing {int(100 * DROP)}% a year past their position’s usual cliff '
-                '(QB 35, RB 27, WR 29, TE 30) and players in their first two seasons gaining 15% a year. A rookie taken in this year’s '
+                '(QB 35, RB 27, WR 29, TE 30) and players in their first two seasons gaining 15% a year. A first-year player taken in this year’s expansion '
                 'draft is worth at least what his pick was worth. 100 = league average. Ages are today’s, from Sleeper.</p>'))
 
     # future pick ownership
@@ -371,7 +371,7 @@ def sections(lg):
         if o != orig:
             trades_.append(f'<li>{s} round {rd}: {_team(lg.team[orig])}’s pick, now {_team(lg.team[o])}’s</li>')
     out.append(("future-picks", "Future pick ownership",
-                '<p class="lede">Who holds every rookie pick in the next three drafts.</p>'
+                '<p class="lede">Who holds every pick in the next three expansion drafts.</p>'
                 '<div class="panel scroll"><table class="grid-t sortable"><thead><tr><th rowspan="2">Team</th>' + head
                 + '<th rowspan="2" class="n">1sts</th><th rowspan="2" class="n">Picks</th></tr><tr>' + sub + '</tr></thead>'
                 f'<tbody>{"".join(body)}</tbody></table></div>'
@@ -445,14 +445,14 @@ def hit_rates(sums):
     rows = []
     for s in sorted(by_season):
         ds = by_season[s].get("draft_slots") or []
-        kind = "Startup" if s == first else "Rookie"
+        kind = "Startup" if s == first else "Expansion"
         rounds = collections.defaultdict(list)
         for d in ds:
-            band = d["round"] if kind == "Rookie" else (d["round"] - 1) // 3 * 3 + 1
+            band = d["round"] if kind == "Expansion" else (d["round"] - 1) // 3 * 3 + 1
             rounds[band].append(d)
         for band, picks in sorted(rounds.items()):
             h = [d for d in picks if hit(d["pid"], d["pos"], s)]
-            label = f'Round {band}' if kind == "Rookie" else (f'Rounds {band}–{min(band + 2, max(d["round"] for d in ds))}')
+            label = f'Round {band}' if kind == "Expansion" else (f'Rounds {band}–{min(band + 2, max(d["round"] for d in ds))}')
             rows.append({"draft": f"{s} {kind.lower()}", "label": label, "n": len(picks), "hits": len(h),
                          "best": sorted(picks, key=lambda d: -sum((by_season[y].get("season_pts") or {}).get(d["pid"], [0, 0])[0] for y in by_season if y >= s))[:3],
                          "season": s})
@@ -478,18 +478,18 @@ def hit_rates_html(sums):
         for r in rows)
     slot_html = ""
     if slots:
-        slot_html = ('<h3 style="margin-top:16px">Rookie first round, slot by slot</h3><div class="panel scroll"><table><thead><tr><th>Pick</th>'
+        slot_html = ('<h3 style="margin-top:16px">Expansion draft first round, slot by slot</h3><div class="panel scroll"><table><thead><tr><th>Pick</th>'
                      '<th>Players taken</th><th class="n">Starters</th></tr></thead><tbody>'
                      + "".join(f'<tr><td>1.{n:02d}</td><td style="font-size:13px">'
                                + ", ".join(f'{esc(d["name"])} <span class="muted">{s} · {since(d, s):.0f} pts</span>' + (" ✓" if h else "") for s, d, h in xs)
                                + f'</td><td class="n">{sum(1 for *_, h in xs if h)} of {len(xs)}</td></tr>' for n, xs in sorted(slots.items()))
                      + '</tbody></table></div>')
-    return ('<p class="lede">How often each round turns up a starter, for the startup draft and every rookie draft.</p>'
+    return ('<p class="lede">How often each round turns up a starter, for the startup draft and every expansion draft.</p>'
             '<div class="panel scroll"><table class="sortable"><thead><tr><th>Draft</th><th>Rounds</th><th class="n">Picks</th>'
             '<th class="n">Starters</th><th class="n">Hit rate</th><th>Best picks (pts since)</th></tr></thead>'
             f'<tbody>{body}</tbody></table></div>{slot_html}<p class="note">A pick is a hit once the player has a season as a '
             'starter at his position by regular-season points among rostered players: top 24 RB or WR, top 12 QB, TE, K or defense. '
-            'Startup rounds are grouped in threes. Rookie classes need time, so their hit rates will climb.</p>')
+            'Startup rounds are grouped in threes. Expansion classes lean on rookies, who need time, so their hit rates will climb.</p>')
 
 
 def startup_redraft_html(sums):
@@ -518,7 +518,7 @@ def startup_redraft_html(sums):
 
 
 def pick_ledger_html(sums):
-    """Every trade that moved a rookie pick, and who the pick became."""
+    """Every trade that moved a draft pick, and who the pick became."""
     by_season = {x["season"]: x for x in sums}
     teams = {}
     for x in sums:
@@ -548,7 +548,7 @@ def pick_ledger_html(sums):
         f'<td data-v="{r["pts"] if r["pts"] is not None else -1:.1f}">'
         + (f'{esc(r["became"]["name"])} <span class="muted">{r["became"]["pos"]} · {r["pts"]:.0f} pts</span>' if r["became"] else '<span class="muted">not used yet</span>')
         + '</td></tr>' for r in rows)
-    return ('<p class="lede">Every trade that moved a rookie pick, newest first, and who the pick turned into.</p>'
+    return ('<p class="lede">Every trade that moved an expansion draft pick, newest first, and who the pick turned into.</p>'
             '<div class="panel scroll"><table class="sortable"><thead><tr><th>When</th><th>Pick</th><th>Got the pick</th><th>Sent it</th>'
             f'<th>Became</th></tr></thead><tbody>{body}</tbody></table></div><p class="note">A pick that moved more than once shows '
-            'once per trade. Points = regular-season points the drafted player has scored since his rookie season began.</p>')
+            'once per trade. Points = regular-season points the drafted player has scored from that draft’s season on.</p>')

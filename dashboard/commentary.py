@@ -629,7 +629,8 @@ blown leads, and whoever is circling the drain. Give credit where it's due too, 
 Don't hold back. Profanity is fine in moderation. Keep it about fantasy football and the decisions people made - no jokes about
 real players' personal lives, health or off-field legal troubles, and nothing hateful.
 
-This is a dynasty league: managers keep their players year to year, draft rookies each summer and trade future draft picks,
+This is a dynasty league: managers keep their players year to year, add players in an annual expansion draft each summer (rookies plus
+any unrostered veterans) and trade future draft picks,
 so not every team is trying to win this season. Some are contending and some are rebuilding (tanking for better picks and
 building around young players). Judge each team by what it is trying to do, and call out the ones failing at it: a contender
 that keeps losing or a team that traded for veterans and is still sinking (a failed push), and a rebuilder that sold off
@@ -786,7 +787,7 @@ def _preview_lines(f, rnd):
     if cooked:
         s = min(cooked, key=lambda s: s["playoff_odds"])
         out.append(f"And {_b(s['team'])}: {s['playoff_odds']}% playoff odds. In a dynasty league that's either a plan or a problem; "
-                   f"the rookie draft will tell us which.")
+                   f"the expansion draft will tell us which.")
     return out
 
 
