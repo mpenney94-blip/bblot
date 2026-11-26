@@ -22,6 +22,7 @@ from dashboard.render import esc
 # page tags them "new" for NEW_DAYS after (finished seasons are cached, so a tag there could outstay its two weeks).
 # Add an entry whenever a table is added or meaningfully changed; old entries can stay (they simply stop showing).
 SECTION_NEW = {
+    "flex": "2026-11-26", "trades": "2026-11-26",
 }
 NEW_DAYS = 14
 

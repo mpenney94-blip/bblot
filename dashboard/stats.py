@@ -756,11 +756,16 @@ def trades(lg):
                    for p, rr in (t.get("adds") or {}).items() if rr == r]
             pick_list = [{"season": str(dp["season"]), "round": dp["round"], "orig": lg.owner.get(dp.get("roster_id"))}
                          for dp in (t.get("draft_picks") or []) if dp.get("owner_id") == r]
-            picks = []
-            for pk in pick_list:  # a pick from this season's draft already has a name on it
+            picks, pick_got = [], []
+            for pk in pick_list:  # a pick from this season's draft already has a player on it, whose points count too
                 who = drafted_with(lg, pk) if pk["season"] == str(lg.season) else None
-                picks.append(f"{pk['season']} round {pk['round']} pick" + (f" ({lg.name_of(who)})" if who else ""))
-            sides.append({"team": lg.team[r], "got": got, "picks": picks, "pick_list": pick_list, "total": sum(g["since"] for g in got)})
+                if who:
+                    pick_got.append({"player": lg.name_of(who), "pid": who, "pos": lg.pos_of(who), "via": f"{pk['season']} round {pk['round']} pick",
+                                     "since": sum(lg.pts.get(who, {}).get(w, 0) for w in weeks)})
+                else:
+                    picks.append(f"{pk['season']} round {pk['round']} pick (not used yet)")
+            sides.append({"team": lg.team[r], "got": got, "picks": picks, "pick_got": pick_got, "pick_list": pick_list,
+                          "total": sum(g["since"] for g in got) + sum(g["since"] for g in pick_got)})
         out.append({"weeks": weeks, "when": dt.datetime.fromtimestamp(t["status_updated"] / 1000, dt.timezone.utc), "sides": sides})
     return out
 
