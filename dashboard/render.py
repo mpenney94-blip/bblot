@@ -350,10 +350,11 @@ def flex_table(rows, weeks):
                 cells.append('<td class="w muted" data-v="-1">–</td>')
                 continue
             tip = "; ".join(f"Week {w}: {n} {pos} {v:.1f}" if n else f"Week {w}: empty" for n, pos, v in got)
-            lab = "<br>".join(f'{pos}<div style="font-size:11px;font-weight:600;opacity:.8">{v:.1f}</div>' if n else '<span class="neg">∅</span>'
-                              for n, pos, v in got)
-            bg = FLEX_TINT.get(got[0][1], "transparent")
-            cells.append(f'<td class="w" style="background:{bg}" data-v="{sum(v for _, _, v in got):.2f}" title="{esc(tip)}">{lab}</td>')
+            # one tinted block per flex spot (this league starts two), each colored by its own position
+            lab = "".join(f'<div style="background:{FLEX_TINT.get(pos, "transparent")};border-radius:3px;padding:3px 2px;margin:1px 0">'
+                          + (f'{pos}<div style="font-size:11px;font-weight:600;opacity:.8">{v:.1f}</div>' if n else '<span class="neg">∅</span>')
+                          + '</div>' for n, pos, v in got)
+            cells.append(f'<td class="w" style="padding:2px" data-v="{sum(v for _, _, v in got):.2f}" title="{esc(tip)}">{lab}</td>')
         tot = {p: [0, 0.0] for p in poss}
         for _, n, pos, v in r["weeks"]:
             if n and pos in tot:
@@ -377,7 +378,7 @@ def flex_table(rows, weeks):
             + "".join(f'<th class="n">{w}</th>' for w in weeks)
             + "".join(f'<th class="n">{p} starts · pts</th>' for p in poss)
             + f'<th class="n">Flex pts</th><th class="n">Per week</th></tr></thead><tbody>{"".join(body)}</tbody></table></div>'
-            f'<p class="note">Who each team started in its flex spot every week, and what he scored. Columns at the right: starts and points '
+            f'<p class="note">Who each team started in its two flex spots every week, and what they scored. Columns at the right: starts and points '
             f'by position. League-wide, flex points per start: {lg_note}. Click a team for the players. Click a column header to sort '
             f'(week columns sort by that week’s flex points).</p>')
 
@@ -650,7 +651,7 @@ def trade_cards(trades):
         span = "no games yet" if not w else (f"Week {w[0]}" if len(w) == 1 else f"Weeks {w[0]}–{w[-1]}")
         lead = max(t["sides"], key=lambda s: s["total"])
         margin = lead["total"] - min(s["total"] for s in t["sides"])
-        mx = max(max((g["since"] for s in t["sides"] for g in s["got"]), default=1), 1)
+        mx = max(max((g["since"] for s in t["sides"] for g in s["got"] + s.get("pick_got", [])), default=1), 1)
         head = f'{esc(lead["team"])} ahead by {margin:.1f}' if w else "Too early to call"
         body = [f'<div class="panel"><div class="eyebrow">Trade {i} · {t["when"].astimezone(PT):%b %-d} · counts {span}</div><h3>{head}</h3>']
         for s in t["sides"]:
@@ -659,13 +660,18 @@ def trade_cards(trades):
                 body.append(f'<tr><td>{esc(g["player"])} <span class="muted">{g["pos"] or ""}</span></td><td class="barcell"><div class="track">'
                             f'<span style="width:{100 * g["since"] / mx:.1f}%;background:{"var(--good)" if s is lead and w else "var(--mark)"}"></span></div></td>'
                             f'<td class="n team">{g["since"]:.1f}</td></tr>')
+            for g in s.get("pick_got", []):  # players drafted with picks this side got
+                body.append(f'<tr><td>{esc(g["via"])} <span class="muted">→</span> {esc(g["player"])} <span class="muted">{g["pos"] or ""}</span></td>'
+                            f'<td class="barcell"><div class="track"><span style="width:{100 * g["since"] / mx:.1f}%;'
+                            f'background:{"var(--good)" if s is lead and w else "var(--mark)"}"></span></div></td><td class="n team">{g["since"]:.1f}</td></tr>')
             for p in s["picks"]:
                 body.append(f'<tr><td colspan="3" class="muted">{esc(p)}</td></tr>')
             body.append(f'</table><div class="n muted" style="font-size:14px">Total <b style="color:var(--ink)">{s["total"]:.1f}</b></div>')
         body.append('</div>')
         cards.append("".join(body))
     return ('<div class="grid2">' + "".join(cards) + '</div><p class="note">Points each player has scored since the trade, wherever they played, '
-            'counting from the first week whose games started after it.</p>')
+            'counting from the first week whose games started after it. A traded pick from this season’s draft counts the points of '
+            'the player taken with it; picks for later drafts are listed until they’re used (the all-time page follows them).</p>')
 
 
 def waiver_wars(claims, per_team, teams):
