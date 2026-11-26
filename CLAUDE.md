@@ -59,7 +59,9 @@ Run the build without piping its exit code away; an exception mid-build leaves a
 ## League rules (encoded; playoff format to be confirmed by the owner)
 
 - Dynasty from 2025 (the startup draft: 26-round snake). Seasons before 2025 were redraft and are ignored. Every later
-  draft is a 5-round linear rookie draft. Draft sections are titled by kind ("Startup draft" / "Rookie draft").
+  draft is a 5-round linear annual expansion draft: rookies plus any player not on a roster (not "rookie draft": veterans can
+  be taken). Draft sections are titled by kind ("Startup draft" / "Expansion draft"). The expansion draft's redraft only
+  ranks players who were in that pool (`stats.pre_draft_rostered` rebuilds the rosters at draft time).
 - 12 teams, 2 divisions. Playoffs (6 teams): each division winner gets a bye, then the next 4 best records regardless of
   division; points for breaks ties (`weekly` seeding and `_misses`).
 - FAAB: $100 in 2025, $1,000 from 2026 (`lg.faab_budget` from `waiver_budget`). Every FAAB number is shown as a % of
@@ -70,13 +72,17 @@ Run the build without piping its exit code away; an exception mid-build leaves a
   today's taxi lists (taxi players can only be promoted). Their points sit in `m["inactive_points"]`.
 - Scoring all comes from Sleeper's settings (kicker scoring verified: 190 games, 0 mismatches).
 - No keepers in this league; the keeper sections were removed.
+- "Drafted vs. picked up" (`stats.sources`, all-time too) credits starting-lineup points by how the manager got the player,
+  across every dynasty season (`stats.acquisition_log` reads each earlier season's drafts and transactions): startup draft,
+  each expansion draft by year, waiver/FA pickup, or trade. Each team has a dropdown of the players behind each share.
+- The expansion draft's redraft ranks pool players by points scored; the startup redraft keeps points above replacement.
 
 ## Dynasty model (`dashboard/dynasty.py`)
 
 - Points per game = this season plus last season at half weight. Edge = points per game over replacement (QB 14th, RB
   30th, WR 42nd, TE 14th at his position). Value = edge over 5 seasons, each later one at 85%, losing 30% a year past
-  the position cliff (QB 35, RB 27, WR 29, TE 30), +15% a year for first- and second-year players. A rookie drafted
-  this year is worth at least his pick. Pick value by round = the value of the league's 30th/70th/110th/150th/190th player.
+  the position cliff (QB 35, RB 27, WR 29, TE 30), +15% a year for first- and second-year players. A first-year player taken in this
+  year's expansion draft is worth at least his pick. Pick value by round = the value of the league's 30th/70th/110th/150th/190th player.
 - Contention tags from all-play rank (thirds) and this season's trades: win-now edge from players 26+ gained or given
   away; young players and picks count as building. Tags: Contender, All in, Winning while selling, Pushing, Retooling,
   In the middle, Failed tank (sold but top half), Failed push (bought, bottom third), Rebuilding, Stuck.

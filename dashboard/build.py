@@ -22,7 +22,8 @@ from dashboard.render import esc
 # page tags them "new" for NEW_DAYS after (finished seasons are cached, so a tag there could outstay its two weeks).
 # Add an entry whenever a table is added or meaningfully changed; old entries can stay (they simply stop showing).
 SECTION_NEW = {
-    "flex": "2026-11-26", "trades": "2026-11-26",
+    "flex": "2026-11-26", "trades": "2026-11-26", "redraft": "2026-11-26", "sources": "2026-11-26",
+    "alltime-sources": "2026-11-26",
 }
 NEW_DAYS = 14
 
@@ -287,8 +288,8 @@ def build(league_id, out, with_winprob=True, tabs="", past_sums=None):
     hub = week_hub(lg, last, with_winprob, wp_cache, odds, div_names)
     season_games = [(lg.season, *g) for g in stats.game_list(lg) if not g[5]]
     team_html = lambda o, _s: f'<span class="team">{esc(next((n for r, n in lg.team.items() if lg.owner[r] == o), "?"))}</span>'
-    startup = int(lg.season) == config.FIRST_SEASON  # the 2025 draft was the dynasty startup; every one after is a rookie draft
-    kind = "Startup draft" if startup else "Rookie draft"
+    startup = int(lg.season) == config.FIRST_SEASON  # the 2025 draft was the dynasty startup; every one after is an annual expansion draft
+    kind = "Startup draft" if startup else "Expansion draft"
     inj_rows = weekly.injuries(lg)
     proj_rows, proj_over, proj_under = weekly.vs_projection(lg)
     tr_rows, tr_league = weekly.trends(lg)
@@ -342,7 +343,7 @@ def build(league_id, out, with_winprob=True, tabs="", past_sums=None):
         "draft-board": (f"{kind} board", render.draft_board(dx, lg.team)) if dx else None,
         "redraft": (f"{kind.split()[0]} redraft", render.redraft_table(dx)) if dx else None,
         "payoff": ("Which positions paid off", render.payoff_table(dx)) if dx else None,
-        "sources": ("Drafted vs. picked up", render.source_bars(src)),
+        "sources": ("Drafted vs. picked up", render.source_bars(src, stats.source_kinds(range(config.FIRST_SEASON, int(lg.season) + 1)))),
         "first-round": ("First round what ifs", f'<p class="lede">What if your first-round {kind.lower()} pick had been someone '
                         'else’s? Pick a team and another first-rounder to replay the season.</p>' + render.fractal_html(stats.fractalverse(lg))),
         "draft": (f"{kind} report card", draft_chart(lg)),
@@ -358,7 +359,7 @@ def build(league_id, out, with_winprob=True, tabs="", past_sums=None):
         ("roster", "Roster", "Trades, byes, injuries, lineup calls and the waiver wire.",
          ["trades", "byes", "injuries", "ages", "bench", "flex", "waivers", "churn", "waiver-wars", "perfect-bids", "overbids", "drops", "position"]),
         ("draft-group", kind, ("How the startup draft played out, and how much each team still leans on it." if startup else
-                                "How this year’s rookie draft played out so far, and how much each team leans on what it drafted."),
+                                "How this year’s expansion draft (rookies plus anyone left unrostered) played out so far, and how much each team leans on what it drafted."),
          ["draft-grades", "draft", "draft-board", "redraft", "rounds", "payoff", "sources", "first-round"]),
     ]
     if dyn:  # dynasty views describe rosters as they stand today, so only the current season has them
@@ -396,9 +397,9 @@ def build(league_id, out, with_winprob=True, tabs="", past_sums=None):
     with open(os.path.join(out, "summary.json"), "w") as f:  # this season's totals, for the all-time page
         summary = stats.season_summary(lg)
         summary["injuries"] = injury_summary(lg, inj_rows)
-        summary["sources"] = {lg.owner[r]: {"draft": round(src[n]["draft"], 1), "keeper": round(src[n]["keeper"], 1),
-                                            "waiver": round(src[n]["waiver"], 1), "trade": round(src[n]["trade"], 1),
-                                            "best": {k: [v[0], round(v[1], 1)] for k, v in src[n]["best"].items()}}
+        summary["sources"] = {lg.owner[r]: {"by": {k: round(v, 1) for k, v in src[n]["by"].items()},
+                                            "best": {k: [v[0], round(v[1], 1)] for k, v in src[n]["best"].items()},
+                                            "detail": src[n]["detail"]}
                               for r, n in lg.team.items() if n in src}
         json.dump(summary, f)
     with open(os.path.join(out, ".nojekyll"), "w"):

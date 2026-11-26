@@ -971,40 +971,46 @@ def carry_bars(rows):
             'Pick a position to rank teams by how much of their scoring came from it, or Total points to rank by starting-lineup points.</p>')
 
 
-def source_bars(src):
-    kinds = [("draft", "Drafted", 1), ("waiver", "Waiver / free agent", 2), ("trade", "Trade", 3)]
-    legend = '<div class="legend">' + "".join(f'<span><i style="background:var(--c{c})"></i>{lab}</span>' for _, lab, c in kinds) + '</div>'
-    opts = ('<option value="total" data-plain data-hint="Most starting-lineup points first" selected>Total points</option>'
-            + "".join(f'<option value="{k}" data-label="{lab}">{lab} share</option>' for k, lab, _ in kinds))
-    controls = (f'<div class="hl-bar"><label for="sources-sort">Sort by</label><select id="sources-sort" autocomplete="off">{opts}</select>'
-                f'<span class="muted sort-hint"></span></div>')
+def source_bars(src, kinds):
+    """kinds: [(key, label, color)] from stats.source_kinds. One row per team with a dropdown of the players behind each share."""
+    kinds = [k for k in kinds if any(r["by"].get(k[0]) for r in src.values())]
+    legend = '<div class="legend">' + "".join(f'<span><i style="background:{c}"></i>{lab}</span>' for _, lab, c in kinds) + '</div>'
     trs = []
-    for r in sorted(src.values(), key=lambda r: -r["total"]):
-        segs, data = [], [f'data-total="{r["total"]:.1f}"']
+    for i, r in enumerate(sorted(src.values(), key=lambda r: -r["total"])):
+        tot = r["total"] or 1
+        share = {k: r["by"][k] / tot for k, _, _ in kinds}
+        segs = "".join(f'<span style="flex:{share[k]:.4f};background:{c}" title="{lab}: {r["by"][k]:.1f} pts ({share[k]:.0%})">'
+                       + (f'{share[k]:.0%}' if share[k] >= .08 else "") + '</span>' for k, lab, c in kinds if r["by"][k] > 0)
+        cells = "".join(f'<td class="n" data-v="{r["by"][k] / tot:.4f}">{r["by"][k]:.0f}<div class="muted" style="font-size:11px">{r["by"][k] / tot:.0%}</div></td>'
+                        for k, _, _ in kinds)
+        det = []
         for k, lab, c in kinds:
-            share = r[k] / (r["total"] or 1)
-            data.append(f'data-{k}="{share:.4f}" data-{k}-pts="{r[k]:.1f}"')
-            if share > 0:
-                segs.append(f'<span data-pos="{k}" style="flex:{share:.4f};background:var(--c{c})" title="{lab}: {r[k]:.1f} pts ({share:.0%})">'
-                            f'{f"{share:.0%}" if share >= .08 else ""}</span>')
-        best = r["best"].get("waiver")
-        trs.append(f'<tr {" ".join(data)}><td class="muted rank"></td><td class="team" style="white-space:nowrap">{esc(r["team"])}</td>'
-                   f'<td style="width:34%"><div class="stack">{"".join(segs)}</div></td>'
-                   f'<td class="n">{r["draft"]:.1f}</td><td class="n">{r["waiver"]:.1f}</td><td class="n">{r["trade"]:.1f}</td>'
-                   f'<td class="n team">{r["total"]:.1f}</td>'
-                   f'<td style="white-space:nowrap">{esc(best[0]) + f" <span class=muted>{best[1]:.1f}</span>" if best else "<span class=muted>—</span>"}</td></tr>')
-    return (f'<div class="panel scroll sortbars">{controls}{legend}<table><thead><tr><th></th><th>Team</th><th>Share of starting-lineup points</th>'
-            f'<th class="n">Drafted</th><th class="n">Waiver/FA</th><th class="n">Trade</th><th class="n">Total</th><th>Best pickup</th></tr></thead><tbody>{"".join(trs)}</tbody></table></div>'
-            '<p class="note">Starting-lineup points only, credited to how that team got the player at the time: drafted it, picked it up '
-            '(waiver claim or free agent) or traded for it. A drafted player who was dropped and picked back up counts as a pickup. '
-            'Pick a source to rank teams by how much of their scoring came from it, or Total points to rank by starting-lineup points.</p>')
+            xs = r["detail"].get(k) or []
+            if not xs:
+                continue
+            det.append(f'<div style="min-width:220px;flex:1"><div style="font-weight:700;margin-bottom:4px"><i style="display:inline-block;width:10px;height:10px;'
+                       f'border-radius:2px;background:{c};margin-right:6px"></i>{lab} <span class="muted">{r["by"][k]:.1f}</span></div><table class="picks">'
+                       + "".join(f'<tr><td>{esc(n)} <span class="muted">{pos or ""}{" · " + esc(how) if how else ""}</span></td>'
+                                 f'<td class="n muted">{st}×</td><td class="n team">{v:.1f}</td></tr>' for n, pos, v, st, how in xs)
+                       + '</table></div>')
+        trs.append(f'<tr class="xrow" tabindex="0" role="button" aria-expanded="false" aria-controls="src-{i}">'
+                   f'<td class="team" style="white-space:nowrap" data-v="{esc(r["team"].lower())}"><span class="chev" aria-hidden="true">▸</span> {esc(r["team"])}</td>'
+                   f'<td style="width:30%"><div class="stack">{segs}</div></td>{cells}<td class="n team" data-v="{r["total"]:.1f}">{r["total"]:.1f}</td></tr>'
+                   f'<tr class="xdetail" id="src-{i}" hidden><td colspan="{len(kinds) + 3}"><div class="xpin" style="display:flex;flex-wrap:wrap;gap:18px">{"".join(det)}</div></td></tr>')
+    return (f'<div class="panel scroll">{legend}<table class="sortable expand"><thead><tr><th>Team</th><th>Share of starting-lineup points</th>'
+            + "".join(f'<th class="n">{esc(lab)}</th>' for _, lab, _ in kinds)
+            + f'<th class="n">Total</th></tr></thead><tbody>{"".join(trs)}</tbody></table></div>'
+            '<p class="note">Starting-lineup points this season, credited to how the team got the player, looking back to the 2025 startup '
+            'draft: taken in the startup draft, taken in an annual expansion draft, picked up off waivers or free agency (in any season), or '
+            'traded for. A drafted player who was dropped and later picked back up counts as a pickup. Click a team for the players behind '
+            'each share (× = starts). Click a column header to sort.</p>')
 
 
 def round_table(src, rounds):
     mx = max((v for r in src.values() for v in r["rounds"].values()), default=1) or 1
     head = "".join(f'<th class="n">R{i}</th>' for i in range(1, rounds + 1))
     trs = []
-    for r in sorted(src.values(), key=lambda r: -r["draft"]):
+    for r in sorted(src.values(), key=lambda r: -r["this_draft"]):
         cells = []
         for i in range(1, rounds + 1):
             v = r["rounds"].get(i, 0)
@@ -1015,19 +1021,13 @@ def round_table(src, rounds):
             step = max(1, min(7, round(7 * v / mx)))
             fg = "#fff" if step >= 5 else "var(--ink)"
             who = ", ".join(f"{n} {p:.1f}" for n, p in r["round_players"][i].most_common())
-            kept = r["keeper_round"] == i
-            if kept:
-                who = "Keeper: " + who
-            badge = '<span class="star" aria-label="keeper">★</span>' if kept else ""
-            cells.append(f'<td class="w{" kept" if kept else ""}" style="background:var(--r{step});color:{fg}" title="{esc(who)}">{v:.0f}{badge}</td>')
-        trs.append(f'<tr><td class="team" style="white-space:nowrap">{esc(r["team"])}</td>{"".join(cells)}'
-                   f'<td class="n">{r["keeper"]:.0f}</td><td class="n">{r["draft"] - r["keeper"]:.0f}</td><td class="n team">{r["draft"]:.0f}</td></tr>')
-    return (f'<div class="panel scroll"><table class="grid-t"><thead><tr><th>Team</th>{head}<th class="n">Keeper</th><th class="n">New picks</th>'
-            f'<th class="n">Total</th></tr></thead>'
+            cells.append(f'<td class="w" style="background:var(--r{step});color:{fg}" title="{esc(who)}">{v:.0f}</td>')
+        trs.append(f'<tr><td class="team" style="white-space:nowrap">{esc(r["team"])}</td>{"".join(cells)}<td class="n team">{r["this_draft"]:.0f}</td></tr>')
+    return (f'<div class="panel scroll"><table class="grid-t"><thead><tr><th>Team</th>{head}<th class="n">Total</th></tr></thead>'
             f'<tbody>{"".join(trs)}</tbody></table></div>'
-            '<p class="note">Starting-lineup points from each team’s own draft picks, by the round they were taken. Darker = more points; '
-            'hover a cell to see the players (on a “–”, what happened to that pick). Outlined cells with a ★ are each team’s keeper, taken in that round’s slot; '
-            '“New picks” is everything else from this year’s draft. Picks that were traded away, dropped or never started count as –.</p>')
+            '<p class="note">Starting-lineup points from each team’s own picks in this season’s draft, by the round they were taken. Darker = more '
+            'points; hover a cell to see the players (on a “–”, what happened to that pick). Picks that were traded away, dropped or never '
+            'started count as –.</p>')
 
 
 def team_grids(lg_name, grids, weeks, totals):
@@ -1925,7 +1925,7 @@ def alltime_sections(sums):
 
     # trades
     # trades judged across seasons: what each side's players scored after the trade (the rest of that season plus every
-    # later season), and traded picks valued by the player drafted with them (his points from his rookie season on)
+    # later season), and traded picks valued by the player drafted with them (his points from that draft's season on)
     by_season = {x["season"]: x for x in sums}
     later = lambda pid, season: sum((by_season[s_].get("season_pts") or {}).get(pid, [0, 0])[0] for s_ in by_season if s_ > season)
     from_season = lambda pid, season: sum((by_season[s_].get("season_pts") or {}).get(pid, [0, 0])[0] for s_ in by_season if s_ >= season)
@@ -2224,7 +2224,7 @@ def alltime_sections(sums):
                    '<p class="note">Regular season and playoff games in order, carrying over from one season to the next.</p>')
 
     # draft history: every draft judged by what its picks have scored since, across seasons (the first dynasty season's
-    # draft is the startup; every later one is a rookie draft)
+    # draft is the startup; every later one is an annual expansion draft)
     first_season = min(x["season"] for x in sums)
     dclass = collections.defaultdict(list)  # season -> [pick rows with points since]
     for x in sums:
@@ -2235,7 +2235,7 @@ def alltime_sections(sums):
         for d in pts:
             near = sorted(e["since"] for e in pts if abs(e["pick_no"] - d["pick_no"]) <= 6)
             d["value"] = d["since"] - near[len(near) // 2]
-    kind = lambda y: "startup" if y == first_season else "rookie"
+    kind = lambda y: "startup" if y == first_season else "expansion"
     ftr = []
     seasons_d = sorted(dclass)
     for o in sorted(owners, key=lambda o: -sum(d["value"] for y in seasons_d for d in dclass[y] if d["by"] == o and d["round"] == 1)):
@@ -2259,19 +2259,19 @@ def alltime_sections(sums):
         return lst(title, items, lambda kv: f'<td>{who(kv[0][1])}<div class="muted" style="font-size:12px">{kv[0][0]} {kind(kv[0][0])} draft · '
                                             f'{kv[1][2]} picks · {kv[1][0]:,.0f} pts</div></td><td class="n team {"pos" if kv[1][1] >= 0 else "neg"}">'
                                             f'{signed(kv[1][1], 0)}</td>', cls)
-    rookie = [kv for kv in classes.items() if kind(kv[0][0]) == "rookie"]
+    expansion = [kv for kv in classes.items() if kind(kv[0][0]) == "expansion"]
     startup = [kv for kv in classes.items() if kind(kv[0][0]) == "startup"]
     draft_html = (f'<div class="panel scroll"><table style="font-size:14px"><thead><tr><th>Manager</th>'
                   + "".join(f'<th>{y} {kind(y)} 1st round</th>' for y in seasons_d) + '<th class="n">Total vs. slot</th></tr></thead>'
                   f'<tbody>{"".join(ftr)}</tbody></table></div>'
                   '<div class="grid2" style="margin-top:14px">'
-                  + cls_list("Best rookie classes", sorted(rookie, key=lambda kv: -kv[1][1])[:5], "pos")
-                  + cls_list("Worst rookie classes", sorted(rookie, key=lambda kv: kv[1][1])[:5], "neg")
+                  + cls_list("Best expansion draft classes", sorted(expansion, key=lambda kv: -kv[1][1])[:5], "pos")
+                  + cls_list("Worst expansion draft classes", sorted(expansion, key=lambda kv: kv[1][1])[:5], "neg")
                   + cls_list("Startup draft: best", sorted(startup, key=lambda kv: -kv[1][1])[:5], "pos")
                   + cls_list("Startup draft: worst", sorted(startup, key=lambda kv: kv[1][1])[:5], "neg") + '</div>'
                   f'<p class="note">Every pick is judged by the regular-season points the player has scored since he was drafted, through every '
                   f'season to date (wherever he played), against what picks within six spots of it in the same draft have scored. {first_season} '
-                  'was the startup draft; every draft after it is a rookie draft, and rookies take time, so those numbers grow every season. '
+                  'was the startup draft; every draft after it is an annual expansion draft (rookies plus anyone left unrostered), and young players take time, so those numbers grow every season. '
                   'A class = every pick a manager made in that draft (traded picks count for whoever made them).</p>')
 
     # manager tendencies
@@ -2645,59 +2645,67 @@ def alltime_sections(sums):
                     'injuries = one player’s total cost to one team in one season. Click a manager for each season. Click a column header to sort.</p>')
                    if irows else '<div class="panel muted">No injury data yet.</div>')
 
-    # drafted vs picked up, every season
-    srcs = collections.defaultdict(lambda: {"draft": 0.0, "keeper": 0.0, "waiver": 0.0, "trade": 0.0, "seasons": []})
+    # drafted vs picked up, every season: startup draft, each expansion draft, pickups, trades
+    from dashboard import stats as _stats  # late import: the all-time page needs only this one helper from stats
+    skinds = _stats.source_kinds([x["season"] for x in sums])
+    srcs = collections.defaultdict(lambda: {"by": collections.Counter(), "seasons": [], "detail": collections.defaultdict(list)})
     for x in sums:
         for o, z in (x.get("sources") or {}).items():
-            for k in ("draft", "keeper", "waiver", "trade"):
-                srcs[o][k] += z[k]
+            if "by" not in z:  # an older summary format
+                continue
+            srcs[o]["by"].update(z["by"])
             srcs[o]["seasons"].append((x["season"], z))
-    skinds = [("draft", "Drafted", 1), ("waiver", "Waiver / free agent", 2), ("trade", "Trade", 3)]
+            for k, xs in (z.get("detail") or {}).items():
+                srcs[o]["detail"][k] += [(x["season"], *row) for row in xs]
+    skinds = [k for k in skinds if any(z["by"].get(k[0]) for z in srcs.values())]
     srows = []
-    for i, o in enumerate(sorted((o for o in owners if o in srcs), key=lambda o: -srcs[o]["draft"] / max(1, sum(srcs[o][k] for k, _, _ in skinds)))):
+    for i, o in enumerate(sorted((o for o in owners if o in srcs), key=lambda o: -sum(srcs[o]["by"].values()))):
         z = srcs[o]
-        tot = sum(z[k] for k, _, _ in skinds) or 1
-        bar = "".join(f'<span style="flex:{z[k] / tot:.4f};background:var(--c{c})" title="{lab}: {z[k]:,.0f} pts ({z[k] / tot:.0%})">'
-                      f'{f"{z[k] / tot:.0%}" if z[k] / tot >= .08 else ""}</span>' for k, lab, c in skinds)
-        det = "".join(
-            f'<tr><td class="muted">{s_}</td>' + "".join(
-                f'<td class="n">{y[k] / max(1, sum(y[q] for q, _, _ in skinds)):.0%}</td>' for k, _, _ in skinds)
-            + f'<td class="n team">{sum(y[k] for k, _, _ in skinds):,.0f}</td><td>'
-            + (f'<b>{esc(y["best"]["draft"][0])}</b> <span class="muted">{y["best"]["draft"][1]:.0f}</span>' if y["best"].get("draft") else '<span class="muted">—</span>')
-            + '</td><td>'
-            + (f'<b>{esc(y["best"]["waiver"][0])}</b> <span class="muted">{y["best"]["waiver"][1]:.0f}</span>' if y["best"].get("waiver") else '<span class="muted">—</span>')
-            + '</td><td>' + (f'<b>{esc(y["best"]["trade"][0])}</b> <span class="muted">{y["best"]["trade"][1]:.0f}</span>' if y["best"].get("trade") else '<span class="muted">—</span>')
-            + '</td></tr>' for s_, y in sorted(z["seasons"], key=lambda t: t[0], reverse=True))
-        def best_cell(k):
-            b = max(((y["best"][k][1], y["best"][k][0], s_) for s_, y in z["seasons"] if y["best"].get(k)), default=None)
-            if not b:
-                return '<td data-v="0"><span class="muted">—</span></td>'
-            return (f'<td data-v="{b[0]:.1f}" style="white-space:nowrap"><b>{esc(b[1])}</b> <span class="muted">{b[0]:.0f}</span>'
-                    f'<div class="muted" style="font-size:11px">{b[2]}</div></td>')
-        det = (f'<div class="xpin"><table class="picks"><tr><td class="muted">Season</td><td class="n muted">Drafted</td><td class="n muted">Waiver/FA</td>'
-               f'<td class="n muted">Trade</td><td class="n muted">Points</td><td class="muted">Best draft pick</td><td class="muted">Best pickup</td><td class="muted">Best trade add</td></tr>{det}</table></div>')
+        tot = sum(z["by"].values()) or 1
+        bar = "".join(f'<span style="flex:{z["by"][k] / tot:.4f};background:{c}" title="{lab}: {z["by"][k]:,.0f} pts ({z["by"][k] / tot:.0%})">'
+                      + (f'{z["by"][k] / tot:.0%}' if z["by"][k] / tot >= .08 else "") + '</span>' for k, lab, c in skinds if z["by"][k] > 0)
+        per = ('<table class="picks"><tr><td class="muted">Season</td>' + "".join(f'<td class="n muted">{esc(lab)}</td>' for _, lab, _ in skinds)
+               + '<td class="n muted">Points</td></tr>'
+               + "".join(f'<tr><td class="muted">{s_}</td>' + "".join(f'<td class="n">{y["by"].get(k, 0) / max(1, sum(y["by"].values())):.0%}</td>' for k, _, _ in skinds)
+                         + f'<td class="n team">{sum(y["by"].values()):,.0f}</td></tr>' for s_, y in sorted(z["seasons"], key=lambda t: t[0], reverse=True))
+               + '</table>')
+        cols = []
+        for k, lab, c in skinds:
+            agg = collections.defaultdict(lambda: [0.0, 0, None, set()])  # player -> [pts, starts, pos, seasons]
+            for season_, n, pos, v, st_, how in z["detail"].get(k, []):
+                a_ = agg[n]
+                a_[0] += v
+                a_[1] += st_
+                a_[2] = pos
+                a_[3].add(season_)
+            top = sorted(agg.items(), key=lambda kv: -kv[1][0])[:8]
+            if top:
+                cols.append(f'<div style="min-width:200px;flex:1"><div style="font-weight:700;margin-bottom:4px"><i style="display:inline-block;width:10px;'
+                            f'height:10px;border-radius:2px;background:{c};margin-right:6px"></i>{esc(lab)}</div><table class="picks">'
+                            + "".join(f'<tr><td>{esc(n)} <span class="muted">{v[2] or ""} · {", ".join(sorted(v[3]))}</span></td>'
+                                      f'<td class="n team">{v[0]:.0f}</td></tr>' for n, v in top) + '</table></div>')
+        det = f'<div class="xpin">{per}<div style="display:flex;flex-wrap:wrap;gap:18px;margin-top:10px">{"".join(cols)}</div></div>'
         srows.append(f'<tr class="xrow" tabindex="0" role="button" aria-expanded="false" aria-controls="atsrc-{i}">'
                      f'<td style="white-space:nowrap" data-v="{esc(name[o].lower())}"><span class="chev" aria-hidden="true">▸</span> {who(o)}</td>'
-                     f'<td style="width:30%" data-v="{z["draft"] / tot:.4f}"><div class="stack">{bar}</div></td>'
-                     f'<td class="n" data-v="{z["draft"] / tot:.4f}">{z["draft"]:,.0f}<div class="muted" style="font-size:11px">{z["draft"] / tot:.0%}</div></td>'
-                     f'<td class="n" data-v="{z["keeper"] / tot:.4f}">{z["keeper"]:,.0f}<div class="muted" style="font-size:11px">{z["keeper"] / tot:.0%}</div></td>'
-                     f'<td class="n" data-v="{z["waiver"] / tot:.4f}">{z["waiver"]:,.0f}<div class="muted" style="font-size:11px">{z["waiver"] / tot:.0%}</div></td>'
-                     f'<td class="n" data-v="{z["trade"] / tot:.4f}">{z["trade"]:,.0f}<div class="muted" style="font-size:11px">{z["trade"] / tot:.0%}</div></td>'
-                     f'<td class="n team" data-v="{tot:.1f}">{tot:,.0f}</td>{best_cell("draft")}{best_cell("waiver")}{best_cell("trade")}</tr>'
-                     f'<tr class="xdetail" id="atsrc-{i}" hidden><td colspan="10">{det}</td></tr>')
-    lt = {k: sum(srcs[o][k] for o in srcs) for k in ("draft", "keeper", "waiver", "trade")}
-    ltot = sum(lt[k] for k, _, _ in skinds) or 1
-    sources_html = (('<div class="panel scroll"><div class="legend">' + "".join(f'<span><i style="background:var(--c{c})"></i>{lab}</span>' for _, lab, c in skinds)
-                     + f'</div><table class="sortable expand"><thead><tr><th>Manager</th><th>Share of starting-lineup points</th><th class="n">Drafted</th>'
-                     f'<th class="n">Keepers</th><th class="n">Waiver/FA</th><th class="n">Trade</th><th class="n">Total</th>'
-                     f'<th>Best draft pick</th><th>Best pickup</th><th>Best trade add</th></tr></thead><tbody>{"".join(srows)}</tbody>'
-                     f'<tfoot><tr class="tot"><td class="muted">League</td><td></td>' + "".join(f'<td class="n">{lt[k] / ltot:.0%}</td>' for k in ("draft", "keeper", "waiver", "trade"))
-                     + '<td></td><td></td><td></td><td></td></tr></tfoot></table></div>'
+                     f'<td style="width:30%"><div class="stack">{bar}</div></td>'
+                     + "".join(f'<td class="n" data-v="{z["by"][k] / tot:.4f}">{z["by"][k]:,.0f}<div class="muted" style="font-size:11px">{z["by"][k] / tot:.0%}</div></td>'
+                               for k, _, _ in skinds)
+                     + f'<td class="n team" data-v="{tot:.1f}">{tot:,.0f}</td></tr>'
+                     f'<tr class="xdetail" id="atsrc-{i}" hidden><td colspan="{len(skinds) + 3}">{det}</td></tr>')
+    lt = collections.Counter()
+    for z in srcs.values():
+        lt.update(z["by"])
+    ltot = sum(lt.values()) or 1
+    sources_html = (('<div class="panel scroll"><div class="legend">' + "".join(f'<span><i style="background:{c}"></i>{esc(lab)}</span>' for _, lab, c in skinds)
+                     + '</div><table class="sortable expand"><thead><tr><th>Manager</th><th>Share of starting-lineup points</th>'
+                     + "".join(f'<th class="n">{esc(lab)}</th>' for _, lab, _ in skinds)
+                     + f'<th class="n">Total</th></tr></thead><tbody>{"".join(srows)}</tbody>'
+                     f'<tfoot><tr class="tot"><td class="muted">League</td><td></td>' + "".join(f'<td class="n">{lt[k] / ltot:.0%}</td>' for k, _, _ in skinds)
+                     + '<td></td></tr></tfoot></table></div>'
                      '<p class="note">Starting-lineup points since 2025 (regular season, this season so far included), credited to how the manager '
-                     'got the player at the time: drafted him (keepers included, also shown on their own), picked him up off waivers or free agency, '
-                     'or traded for him. A drafted player who was dropped and picked back up counts as a pickup. Best draft pick, pickup and trade add = '
-                     'the most starting-lineup points one such player scored for him in a single season. Click a manager for each season. '
-                     'Click a column header to sort.</p>') if srows else '<div class="panel muted">No data yet.</div>')
+                     'got the player, looking back through every dynasty season: the 2025 startup draft, an annual expansion draft, a waiver or '
+                     'free-agent pickup, or a trade. A drafted player who was dropped and later picked back up counts as a pickup. Click a manager '
+                     'for each season’s split and the players behind each share. Click a column header to sort.</p>') if srows else '<div class="panel muted">No data yet.</div>')
 
     # roster churn, every season
     allc = {k: [] for k in ("draft_cuts", "quick_cuts", "longest_held", "repeat_adds")}
@@ -2918,7 +2926,10 @@ def redraft_table(d):
             f'<th class="n">Above replacement</th><th>Actually went</th><th class="n">Spots gained</th></tr></thead><tbody>{"".join(trs)}</tbody></table></div>'
             '<p class="note">The first two rounds if the draft were redone knowing this season’s results. Players are ranked by points above a '
             'replacement-level starter at their position (the last starter the league would field there), so quarterbacks don’t take over the board. '
-            'Kickers and defenses are left out. Spots gained = how far up the board he’d go now. Click a column header to sort.</p>')
+            'Kickers and defenses are left out. Spots gained = how far up the board he’d go now. Click a column header to sort.'
+            + (' Only players who were in this draft’s pool count: rookies and anyone not on a roster when the draft began. Since that pool is '
+               'mostly rookies and backups, this redraft ranks by points scored (not points above replacement).' if d.get("expansion") else '')
+            + '</p>')
 
 
 def payoff_table(d):

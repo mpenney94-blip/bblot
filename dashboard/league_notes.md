@@ -5,7 +5,8 @@ real-life news worth a mention. Columns should bring these up now and then, when
 
 ## The league
 - Boys Boys Lots of Toys (BBLOT) is a 12-team dynasty league. It ran as a redraft league before 2025; the 2025 startup draft
-  began the dynasty, and every draft since is a rookie draft. Only 2025 on counts here.
+  began the dynasty, and every draft since is an annual expansion draft: rookies plus
+  any player not on a roster. Only 2025 on counts here.
 - FAAB was $100 in 2025 and $1,000 from 2026, so waiver spending is talked about as a share of the budget.
 - Rosters carry 3 taxi spots and 2 IR spots.
 
