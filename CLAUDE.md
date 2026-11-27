@@ -18,6 +18,7 @@ same, with the dynasty changes below. Fixes to shared code may be worth carrying
   (current season only), and the all-time draft hit rates, startup redraft and pick trade ledger.
 - `dashboard/nemesis.py`: Nemeses (the NFL players who scored the most against each team from opponents' lineups), season
   and all-time (from `nemeses` in each summary.json). The same file is in the Clampions and BBLOT repos.
+  Recaps get `nemesis_watch`: players who hit a team that week and rank in its all-time top 3 nemeses.
 - `dashboard/commentary.py`: fact sheets and the Claude-written columns (recap, preview, rivalry), with a built-in fallback writer.
 - `dashboard/league_notes.md`: league lore fed to the column writer. Fresh for this league (nothing from Clampions); the
   owner will send lore to add. Every manager is he/him (`config.SHE` is empty).
