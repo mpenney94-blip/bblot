@@ -16,6 +16,8 @@ same, with the dynasty changes below. Fixes to shared code may be worth carrying
 - `dashboard/weekly.py`: playoff odds and clinches, power, awards, preview, trends, byes/injuries, career days, flagged plays, kicking.
 - `dashboard/dynasty.py`: roster value with age, contention window, future pick ownership, taxi/IR tracker, dynasty power
   (current season only), and the all-time draft hit rates, startup redraft and pick trade ledger.
+- `dashboard/nemesis.py`: Nemeses (the NFL players who scored the most against each team from opponents' lineups), season
+  and all-time (from `nemeses` in each summary.json). The same file is in the Clampions and BBLOT repos.
 - `dashboard/commentary.py`: fact sheets and the Claude-written columns (recap, preview, rivalry), with a built-in fallback writer.
 - `dashboard/league_notes.md`: league lore fed to the column writer. Fresh for this league (nothing from Clampions); the
   owner will send lore to add. Every manager is he/him (`config.SHE` is empty).
